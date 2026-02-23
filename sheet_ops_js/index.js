@@ -9,7 +9,7 @@ const DEFAULT_EXECUTION_OPTIONS = Object.freeze({
 
 /**
  * @typedef {{ columns: (number | null)[], rows: (number | null)[] }} SpreadsheetState
- * @typedef {{ maxBatchOps?: number, maxPayloadBytes?: number }} ExecutionOptions
+ * @typedef {{ maxBatchOps?: number, maxPayloadBytes?: number, profile?: Record<string, bigint | number> }} ExecutionOptions
  */
 
 /**
@@ -30,6 +30,7 @@ export default async function updateSpreadsheet(
   executionOptions = {}
 ) {
   const execOptions = normalizeExecutionOptions(executionOptions)
+  const profile = isProfileCollector(executionOptions?.profile) ? executionOptions.profile : null
   // Dimension order matters because row/column indices are independent and the
   // challenge examples/process assume the two passes are executed separately.
   const dimensions = [
@@ -39,7 +40,10 @@ export default async function updateSpreadsheet(
 
   for (const [dimension, currentIds, targetIds] of dimensions) {
     const plannedOps = diffDimensionOps(dimension, currentIds, targetIds)
-    await executeInBatches(api, spreadsheetId, plannedOps, execOptions)
+    if (profile) {
+      profile.dimensionPasses = (profile.dimensionPasses ?? 0) + 1
+    }
+    await executeInBatches(api, spreadsheetId, plannedOps, execOptions, profile)
   }
 }
 
@@ -99,19 +103,52 @@ function *diffDimensionOps(dimension, currentIds, targetIds) {
   }
 }
 
-async function executeInBatches(api, spreadsheetId, plannedOps, { maxBatchOps, maxPayloadBytes }) {
+async function executeInBatches(api, spreadsheetId, plannedOps, { maxBatchOps, maxPayloadBytes }, profile = null) {
+  const executeStart = profile ? process.hrtime.bigint() : 0n
   let batch = []
   let batchBytes = 0
+  let opCount = 0
+  const iterator = plannedOps[Symbol.iterator]()
 
-  for (const op of plannedOps) {
+  while (true) {
+    const reconcileStart = profile ? process.hrtime.bigint() : 0n
+    const next = iterator.next()
+    if (profile) {
+      profile.reconcileNs = (profile.reconcileNs ?? 0n) + (process.hrtime.bigint() - reconcileStart)
+    }
+
+    if (next.done) {
+      break
+    }
+
+    const op = next.value
+    opCount += 1
+    if (profile) {
+      if (op[0] === "insert") {
+        profile.insertOps = (profile.insertOps ?? 0) + 1
+      } else {
+        profile.deleteOps = (profile.deleteOps ?? 0) + 1
+      }
+    }
+
+    const estimateStart = profile ? process.hrtime.bigint() : 0n
     const opBytes = estimateOpBytes(op)
+    if (profile) {
+      profile.estimateNs = (profile.estimateNs ?? 0n) + (process.hrtime.bigint() - estimateStart)
+      profile.estimatedPayloadBytes = (profile.estimatedPayloadBytes ?? 0) + opBytes
+    }
     const batchFull = batch.length >= maxBatchOps
     const payloadFull =
       maxPayloadBytes > 0 && batch.length > 0 && batchBytes + opBytes > maxPayloadBytes
 
     // Flush before adding the next op when either guardrail would be exceeded.
     if (batchFull || payloadFull) {
+      const flushStart = profile ? process.hrtime.bigint() : 0n
       await api.performOps(spreadsheetId, batch)
+      if (profile) {
+        profile.apiAwaitNs = (profile.apiAwaitNs ?? 0n) + (process.hrtime.bigint() - flushStart)
+        profile.apiFlushes = (profile.apiFlushes ?? 0) + 1
+      }
       batch = []
       batchBytes = 0
     }
@@ -122,7 +159,17 @@ async function executeInBatches(api, spreadsheetId, plannedOps, { maxBatchOps, m
 
   if (batch.length > 0) {
     // Preserve operation order: the final partial batch must be flushed last.
+    const flushStart = profile ? process.hrtime.bigint() : 0n
     await api.performOps(spreadsheetId, batch)
+    if (profile) {
+      profile.apiAwaitNs = (profile.apiAwaitNs ?? 0n) + (process.hrtime.bigint() - flushStart)
+      profile.apiFlushes = (profile.apiFlushes ?? 0) + 1
+    }
+  }
+
+  if (profile) {
+    profile.executeLoopNs = (profile.executeLoopNs ?? 0n) + (process.hrtime.bigint() - executeStart)
+    profile.streamedOps = (profile.streamedOps ?? 0) + opCount
   }
 }
 
@@ -175,4 +222,8 @@ function digitCount(value) {
   }
 
   return digits
+}
+
+function isProfileCollector(value) {
+  return value !== null && typeof value === "object"
 }

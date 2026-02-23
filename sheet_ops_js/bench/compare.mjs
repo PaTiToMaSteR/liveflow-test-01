@@ -308,6 +308,9 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
     this.apiCallCount = 0
     this.maxBatchSize = 0
     this._pending = new Set()
+    this.applyTotalNs = 0n
+    this.spliceTotalNs = 0n
+    this.progressLogTotalNs = 0n
   }
 
   addSpreadsheet(spreadsheetId, { columns, rows }) {
@@ -357,6 +360,7 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
   }
 
   #applyOps(spreadsheetId, ops) {
+    const applyStart = process.hrtime.bigint()
     const spreadsheet = this.fetchSpreadsheetState(spreadsheetId)
 
     for (const rawOp of ops) {
@@ -366,7 +370,10 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
       this.opsCount += 1
     }
 
+    const progressStart = process.hrtime.bigint()
     this.#maybeLogProgress(spreadsheetId, ops)
+    this.progressLogTotalNs += process.hrtime.bigint() - progressStart
+    this.applyTotalNs += process.hrtime.bigint() - applyStart
   }
 
   #validateOp(spreadsheet, op) {
@@ -386,12 +393,15 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
   }
 
   #applySingleOp(spreadsheet, op) {
+    const spliceStart = process.hrtime.bigint()
     switch (op.action) {
       case "delete":
         spreadsheet[op.dimension + "s"].splice(op.index, 1)
+        this.spliceTotalNs += process.hrtime.bigint() - spliceStart
         return
       case "insert":
         spreadsheet[op.dimension + "s"].splice(op.index, 0, op.value)
+        this.spliceTotalNs += process.hrtime.bigint() - spliceStart
         return
       default:
         throw new Error(`Unknown action: ${op.action}`)
@@ -591,12 +601,14 @@ async function runSingle(label, impl, fixture, runOptions) {
     : mock
 
   mock.addSpreadsheet(spreadsheetId, current)
+  const implProfile = {}
 
   const start = process.hrtime.bigint()
   try {
     const result = impl(executionApi, spreadsheetId, current, target, {
       maxBatchOps: runOptions.maxBatchOps,
       maxPayloadBytes: runOptions.maxPayloadBytes,
+      profile: implProfile,
     })
     if (isPromiseLike(result)) {
       await result
@@ -610,6 +622,7 @@ async function runSingle(label, impl, fixture, runOptions) {
   }
   const elapsedNs = process.hrtime.bigint() - start
 
+  const validationStart = process.hrtime.bigint()
   const immediateState = cloneState(mock.fetchSpreadsheetState(spreadsheetId))
   const mismatchError = assertStateEquals(immediateState, fixture.target, label)
 
@@ -640,6 +653,7 @@ async function runSingle(label, impl, fixture, runOptions) {
   if (!runOptions.batchingEnabled) {
     await executionApi.drainPending?.(spreadsheetId)
   }
+  const validationNs = process.hrtime.bigint() - validationStart
 
   const batchingStats = executionApi instanceof BatchingQuotaApi
     ? {
@@ -653,12 +667,21 @@ async function runSingle(label, impl, fixture, runOptions) {
     }
     : null
 
+  const mockStats = {
+    applyNs: mock.applyTotalNs,
+    spliceNs: mock.spliceTotalNs,
+    progressLogNs: mock.progressLogTotalNs,
+  }
+
   return {
     elapsedNs,
+    validationNs,
     opsCount: mock.opsCount,
     apiCalls: mock.apiCallCount,
     maxBatchSize: mock.maxBatchSize,
     batchingStats,
+    implProfile,
+    mockStats,
   }
 }
 
@@ -696,6 +719,35 @@ async function runBenchmarkForImplementation(label, impl, fixture, options) {
     .map((s) => s.batchingStats?.totalBatchProcessingNs)
     .filter((v) => v !== undefined)
     .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const validationTimes = samples.map((s) => s.validationNs).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const implExecuteLoopTimes = samples
+    .map((s) => s.implProfile?.executeLoopNs)
+    .filter((v) => typeof v === "bigint")
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const implReconcileTimes = samples
+    .map((s) => s.implProfile?.reconcileNs)
+    .filter((v) => typeof v === "bigint")
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const implEstimateTimes = samples
+    .map((s) => s.implProfile?.estimateNs)
+    .filter((v) => typeof v === "bigint")
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const implApiAwaitTimes = samples
+    .map((s) => s.implProfile?.apiAwaitNs)
+    .filter((v) => typeof v === "bigint")
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const mockApplyTimes = samples
+    .map((s) => s.mockStats?.applyNs)
+    .filter((v) => typeof v === "bigint")
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const mockSpliceTimes = samples
+    .map((s) => s.mockStats?.spliceNs)
+    .filter((v) => typeof v === "bigint")
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const mockProgressLogTimes = samples
+    .map((s) => s.mockStats?.progressLogNs)
+    .filter((v) => typeof v === "bigint")
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
 
   return {
     label,
@@ -708,6 +760,14 @@ async function runBenchmarkForImplementation(label, impl, fixture, options) {
     uniqueRetryCounts,
     unique429Counts,
     batchProcessingTimes,
+    validationTimes,
+    implExecuteLoopTimes,
+    implReconcileTimes,
+    implEstimateTimes,
+    implApiAwaitTimes,
+    mockApplyTimes,
+    mockSpliceTimes,
+    mockProgressLogTimes,
   }
 }
 
@@ -721,11 +781,44 @@ function formatBatchingStatsInline(stats) {
 
 function summarizeResult(result) {
   const totalNs = result.times.reduce((acc, ns) => acc + ns, 0n)
+  const sumBigInts = (values) =>
+    values && values.length > 0 ? values.reduce((acc, ns) => acc + ns, 0n) : null
+  const formatBigIntTotal = (values) => {
+    const total = sumBigInts(values)
+    return total === null ? "-" : formatMs(total)
+  }
+
+  let loopOverheadTotal = null
+  if (
+    result.implExecuteLoopTimes.length === result.implReconcileTimes.length &&
+    result.implExecuteLoopTimes.length === result.implEstimateTimes.length &&
+    result.implExecuteLoopTimes.length === result.implApiAwaitTimes.length &&
+    result.implExecuteLoopTimes.length > 0
+  ) {
+    loopOverheadTotal = 0n
+    for (let i = 0; i < result.implExecuteLoopTimes.length; i += 1) {
+      const residual =
+        result.implExecuteLoopTimes[i] -
+        result.implReconcileTimes[i] -
+        result.implEstimateTimes[i] -
+        result.implApiAwaitTimes[i]
+      loopOverheadTotal += residual > 0n ? residual : 0n
+    }
+  }
+
   return {
     minMs: formatMs(result.times[0]),
     medianMs: formatMs(percentile(result.times, 50)),
     totalMs: formatMs(totalNs),
     batchMs: result.batchProcessingTimes?.length ? formatMs(result.batchProcessingTimes.reduce((acc, ns) => acc + ns, 0n)) : "-",
+    verifyMs: formatBigIntTotal(result.validationTimes),
+    algoMs: formatBigIntTotal(result.implReconcileTimes),
+    serializeMs: formatBigIntTotal(result.implEstimateTimes),
+    awaitApiMs: formatBigIntTotal(result.implApiAwaitTimes),
+    loopOverheadMs: loopOverheadTotal === null ? "-" : formatMs(loopOverheadTotal),
+    mockApplyMs: formatBigIntTotal(result.mockApplyTimes),
+    mockSpliceMs: formatBigIntTotal(result.mockSpliceTimes),
+    mockProgressLogMs: formatBigIntTotal(result.mockProgressLogTimes),
     p95Ms: formatMs(percentile(result.times, 95)),
     maxMs: formatMs(result.times[result.times.length - 1]),
     opsCounts: result.uniqueOpsCounts,
@@ -765,6 +858,50 @@ function printFinalTable(rows) {
   const sep = widths.map((w) => "-".repeat(w)).join("-|-")
 
   console.log("\nFinal Comparison Table")
+  console.log(fmt(headers))
+  console.log(sep)
+  for (const row of tableRows) {
+    console.log(fmt(row))
+  }
+}
+
+function printTimingBreakdownTable(rows) {
+  if (rows.length === 0) {
+    return
+  }
+
+  const headers = [
+    "case",
+    "impl",
+    "totalMs",
+    "algoMs",
+    "serializeMs",
+    "awaitApiMs",
+    "loopOverheadMs",
+    "mockApplyMs",
+    "mockSpliceMs",
+    "verifyMs",
+  ]
+  const tableRows = rows.map((row) => [
+    row.caseName,
+    row.impl,
+    row.totalMs,
+    row.algoMs,
+    row.serializeMs,
+    row.awaitApiMs,
+    row.loopOverheadMs,
+    row.mockApplyMs,
+    row.mockSpliceMs,
+    row.verifyMs,
+  ])
+
+  const widths = headers.map((header, i) =>
+    Math.max(header.length, ...tableRows.map((r) => r[i].length))
+  )
+  const fmt = (cells) => cells.map((c, i) => c.padEnd(widths[i])).join(" | ")
+  const sep = widths.map((w) => "-".repeat(w)).join("-|-")
+
+  console.log("\nTiming Breakdown Table (totals across measured runs)")
   console.log(fmt(headers))
   console.log(sep)
   for (const row of tableRows) {
@@ -930,6 +1067,13 @@ async function main() {
         medianMs: s.medianMs,
         totalMs: s.totalMs,
         batchMs: s.batchMs,
+        algoMs: s.algoMs,
+        serializeMs: s.serializeMs,
+        awaitApiMs: s.awaitApiMs,
+        loopOverheadMs: s.loopOverheadMs,
+        mockApplyMs: s.mockApplyMs,
+        mockSpliceMs: s.mockSpliceMs,
+        verifyMs: s.verifyMs,
       })
     }
 
@@ -937,6 +1081,7 @@ async function main() {
   }
 
   printFinalTable(finalRows)
+  printTimingBreakdownTable(finalRows)
   console.log("Done.")
 }
 
