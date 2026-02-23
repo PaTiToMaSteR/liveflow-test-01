@@ -318,6 +318,8 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
     this.apiCallCount = 0
     this.maxBatchSize = 0
     this._pending = new Set()
+    // Breakdown-only timers (enabled via BREAKDOWN=1). These are disabled in
+    // normal benchmark runs because per-op timers materially distort totals.
     this.applyTotalNs = 0n
     this.spliceTotalNs = 0n
     this.progressLogTotalNs = 0n
@@ -807,6 +809,8 @@ function summarizeResult(result) {
     return total === null ? "-" : formatMs(total)
   }
 
+  // `loopOverheadMs` is the residual inside executeInBatches after subtracting
+  // the explicit breakdown buckets we track (`algo`, `serialize`, `awaitApi`).
   let loopOverheadTotal = null
   if (
     result.implExecuteLoopTimes.length === result.implReconcileTimes.length &&
@@ -921,6 +925,8 @@ function printTimingBreakdownTable(rows) {
   const sep = widths.map((w) => "-".repeat(w)).join("-|-")
 
   console.log("\nTiming Breakdown Table (totals across measured runs)")
+  console.log("Note: breakdown columns are diagnostic and not additive; some buckets overlap (e.g. awaitApiMs includes mock apply time in direct mock runs).")
+  console.log("Note: mockSpliceMs is usually the dominant cost for large in-memory mock cases and is not representative of real network/API latency.")
   console.log(fmt(headers))
   console.log(sep)
   for (const row of tableRows) {
@@ -1037,6 +1043,9 @@ async function main() {
   console.log("This uses a local mock (no real Google account / API calls).")
   console.log(`Setup (load/generate/select) before measured runs: ${formatMs(setupNs)} ms`)
   printFixtureSizes(selectedCases)
+  if (collectBreakdown) {
+    console.log("BREAKDOWN=1 is enabled: per-op timers add overhead. Use this mode for diagnostics, not for apples-to-apples throughput comparisons.")
+  }
   console.log("Tip: set TRACE=1 to see per-call progress; set ASYNC_DELAY_MS=1 to expose missing await issues.\n")
 
   for (const [caseName, fixture] of Object.entries(selectedCases)) {

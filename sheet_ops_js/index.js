@@ -9,7 +9,14 @@ const DEFAULT_EXECUTION_OPTIONS = Object.freeze({
 
 /**
  * @typedef {{ columns: (number | null)[], rows: (number | null)[] }} SpreadsheetState
- * @typedef {{ maxBatchOps?: number, maxPayloadBytes?: number, profile?: Record<string, bigint | number> }} ExecutionOptions
+ * @typedef {{
+ *   maxBatchOps?: number,
+ *   maxPayloadBytes?: number,
+ *   // Benchmark-only diagnostics collector used by bench/compare.mjs. This is
+ *   // optional and should be omitted in normal usage; when absent there is no
+ *   // profiling overhead in the solution path.
+ *   profile?: Record<string, bigint | number>
+ * }} ExecutionOptions
  */
 
 /**
@@ -30,6 +37,9 @@ export default async function updateSpreadsheet(
   executionOptions = {}
 ) {
   const execOptions = normalizeExecutionOptions(executionOptions)
+  // Optional benchmark-only instrumentation. The challenge/public API does not
+  // depend on this object; it is only consumed when passed explicitly by the
+  // local benchmark harness.
   const profile = isProfileCollector(executionOptions?.profile) ? executionOptions.profile : null
   // Dimension order matters because row/column indices are independent and the
   // challenge examples/process assume the two passes are executed separately.
@@ -104,6 +114,10 @@ function *diffDimensionOps(dimension, currentIds, targetIds) {
 }
 
 async function executeInBatches(api, spreadsheetId, plannedOps, { maxBatchOps, maxPayloadBytes }, profile = null) {
+  // When profiling is enabled, these buckets are intended for diagnosis, not
+  // for additive accounting. For example, `apiAwaitNs` includes time spent in
+  // the mock's synchronous apply path when the benchmark calls the in-memory
+  // mock directly.
   const executeStart = profile ? process.hrtime.bigint() : 0n
   let batch = []
   let batchBytes = 0
@@ -111,6 +125,7 @@ async function executeInBatches(api, spreadsheetId, plannedOps, { maxBatchOps, m
   const iterator = plannedOps[Symbol.iterator]()
 
   while (true) {
+    // `reconcileNs` measures iterator advancement / op generation only.
     const reconcileStart = profile ? process.hrtime.bigint() : 0n
     const next = iterator.next()
     if (profile) {
@@ -131,6 +146,7 @@ async function executeInBatches(api, spreadsheetId, plannedOps, { maxBatchOps, m
       }
     }
 
+    // `estimateNs` isolates payload-size accounting from reconciliation logic.
     const estimateStart = profile ? process.hrtime.bigint() : 0n
     const opBytes = estimateOpBytes(op)
     if (profile) {
@@ -143,6 +159,8 @@ async function executeInBatches(api, spreadsheetId, plannedOps, { maxBatchOps, m
 
     // Flush before adding the next op when either guardrail would be exceeded.
     if (batchFull || payloadFull) {
+      // Await time here is usually tiny with real batching, but in the local
+      // benchmark it also includes synchronous in-memory mutation time.
       const flushStart = profile ? process.hrtime.bigint() : 0n
       await api.performOps(spreadsheetId, batch)
       if (profile) {
