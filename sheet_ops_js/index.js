@@ -38,15 +38,15 @@ export default async function updateSpreadsheet(
   ]
 
   for (const [dimension, currentIds, targetIds] of dimensions) {
-    const plannedOps = diffDimension(dimension, currentIds, targetIds)
+    const plannedOps = diffDimensionOps(dimension, currentIds, targetIds)
     await executeInBatches(api, spreadsheetId, plannedOps, execOptions)
   }
 }
 
-function diffDimension(dimension, currentIds, targetIds) {
+function *diffDimensionOps(dimension, currentIds, targetIds) {
   // Reverse traversal keeps emitted insert/delete indices stable as ops are
-  // applied in order. This is the same invariant as the original algorithm.
-  const plannedOps = []
+  // applied in order. Streaming via a generator avoids materializing very
+  // large intermediate op arrays before execution.
   let currentIdx = currentIds.length - 1
   let targetIdx = targetIds.length - 1
 
@@ -69,7 +69,7 @@ function diffDimension(dimension, currentIds, targetIds) {
     }
 
     if (currentIdx < 0) {
-      plannedOps.push(["insert", dimension, 0, targetId])
+      yield ["insert", dimension, 0, targetId]
       targetIdx--
       continue
     }
@@ -78,7 +78,7 @@ function diffDimension(dimension, currentIds, targetIds) {
     // user-defined placeholders (`null`) which we never delete.
     if (targetIdx < 0) {
       if (currentId !== null) {
-        plannedOps.push(["delete", dimension, currentIdx])
+        yield ["delete", dimension, currentIdx]
       }
       currentIdx--
       continue
@@ -87,18 +87,16 @@ function diffDimension(dimension, currentIds, targetIds) {
     // `null` is a user placeholder. We cannot delete it, so we insert the
     // target id around it and let future iterations align placeholders.
     if (currentId === null) {
-      plannedOps.push(["insert", dimension, currentIdx + 1, targetId])
+      yield ["insert", dimension, currentIdx + 1, targetId]
       targetIdx--
       continue
     }
 
     // Mismatch on a real id: preserve original behavior and delete from the
     // current sequence, then continue reconciling at the same target index.
-    plannedOps.push(["delete", dimension, currentIdx])
+    yield ["delete", dimension, currentIdx]
     currentIdx--
   }
-
-  return plannedOps
 }
 
 async function executeInBatches(api, spreadsheetId, plannedOps, { maxBatchOps, maxPayloadBytes }) {
@@ -153,7 +151,28 @@ function normalizeNonNegativeInt(value, fallback) {
 }
 
 function estimateOpBytes(op) {
-  // Operation payloads here are ASCII-only (action/dimension strings + numbers),
-  // so string length is a good proxy for byte size and keeps this helper runtime-agnostic.
-  return JSON.stringify(op).length
+  // Payloads are ASCII-only and op shapes are fixed, so we can estimate JSON
+  // size without allocating a string for every operation.
+  if (op[0] === "insert") {
+    const base = op[1] === "row" ? 18 : 21
+    return base + digitCount(op[2]) + digitCount(op[3])
+  }
+
+  const base = op[1] === "row" ? 17 : 20
+  return base + digitCount(op[2])
+}
+
+function digitCount(value) {
+  if (value < 10) {
+    return 1
+  }
+
+  let digits = 0
+  let n = value
+  while (n > 0) {
+    n = Math.floor(n / 10)
+    digits++
+  }
+
+  return digits
 }

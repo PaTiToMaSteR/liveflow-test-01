@@ -121,13 +121,32 @@ function repeatFixture(fixture, repeatCount) {
   }
 }
 
-function addGeneratedLargeCases(allCases, { largeRepeat, largeElixirRepeat }) {
+function tryLoadPregeneratedRepeatFixture(sourceCaseName, repeatCount) {
+  const prefix = `${sourceCaseName}_repeat_${repeatCount}`
+  const currentPath = path.join(projectRoot, "bench", "generated", `${prefix}_current.json`)
+  const targetPath = path.join(projectRoot, "bench", "generated", `${prefix}_target.json`)
+
+  if (!fs.existsSync(currentPath) || !fs.existsSync(targetPath)) {
+    return null
+  }
+
+  return {
+    current: JSON.parse(fs.readFileSync(currentPath, "utf8")),
+    target: JSON.parse(fs.readFileSync(targetPath, "utf8")),
+  }
+}
+
+function addGeneratedLargeCases(allCases, { largeRepeat, largeElixirRepeat, usePregeneratedRepeat }) {
   if (largeRepeat > 1) {
-    allCases.large_repeat = repeatFixture(allCases.large, largeRepeat)
+    allCases.large_repeat =
+      (usePregeneratedRepeat && tryLoadPregeneratedRepeatFixture("large", largeRepeat)) ??
+      repeatFixture(allCases.large, largeRepeat)
   }
 
   if (largeElixirRepeat > 1) {
-    allCases.large_elixir_repeat = repeatFixture(allCases.large_elixir, largeElixirRepeat)
+    allCases.large_elixir_repeat =
+      (usePregeneratedRepeat && tryLoadPregeneratedRepeatFixture("large_elixir", largeElixirRepeat)) ??
+      repeatFixture(allCases.large_elixir, largeElixirRepeat)
   }
 }
 
@@ -143,6 +162,59 @@ function percentile(sortedValues, p) {
 
 function formatMs(ns) {
   return (Number(ns) / 1_000_000).toFixed(3)
+}
+
+function digitCount(value) {
+  if (value < 10) {
+    return 1
+  }
+
+  let digits = 0
+  let n = value
+  while (n > 0) {
+    n = Math.floor(n / 10)
+    digits += 1
+  }
+  return digits
+}
+
+function estimateIdsArrayJsonBytes(values) {
+  let bytes = 2
+
+  for (let i = 0; i < values.length; i += 1) {
+    if (i > 0) {
+      bytes += 1
+    }
+    bytes += values[i] === null ? 4 : digitCount(values[i])
+  }
+
+  return bytes
+}
+
+function estimateStateJsonBytes(state) {
+  return 20 + estimateIdsArrayJsonBytes(state.columns) + estimateIdsArrayJsonBytes(state.rows)
+}
+
+function formatByteSize(bytes) {
+  return `${bytes} B (${(bytes / 1_000_000).toFixed(3)} MB, ${(bytes / 1024 / 1024).toFixed(3)} MiB)`
+}
+
+function printFixtureSizes(selectedCases) {
+  console.log("Fixture sizes (pre-run, before measured timing):")
+
+  for (const [caseName, fixture] of Object.entries(selectedCases)) {
+    const currentBytes = estimateStateJsonBytes(fixture.current)
+    const targetBytes = estimateStateJsonBytes(fixture.target)
+    const combinedBytes = currentBytes + targetBytes
+
+    console.log(
+      `  ${caseName}: current=${formatByteSize(currentBytes)}, target=${formatByteSize(targetBytes)}, combined=${formatByteSize(combinedBytes)}`
+    )
+    console.log(
+      `      currentLens(columns=${fixture.current.columns.length}, rows=${fixture.current.rows.length}), ` +
+      `targetLens(columns=${fixture.target.columns.length}, rows=${fixture.target.rows.length})`
+    )
+  }
 }
 
 function safeStringify(value) {
@@ -783,12 +855,15 @@ async function main() {
   const traceBatching = boolEnv("TRACE_BATCHING", false)
   const largeRepeat = intEnv("LARGE_REPEAT", 0)
   const largeElixirRepeat = intEnv("LARGE_ELIXIR_REPEAT", 0)
+  const usePregeneratedRepeat = boolEnv("USE_PREGENERATED_REPEAT", false)
   const batchSweep = parseBatchSweep()
   const implEntries = parseImplementationSelection()
 
+  const setupStart = process.hrtime.bigint()
   const allCases = buildCases()
-  addGeneratedLargeCases(allCases, { largeRepeat, largeElixirRepeat })
+  addGeneratedLargeCases(allCases, { largeRepeat, largeElixirRepeat, usePregeneratedRepeat })
   const selectedCases = selectCases(allCases, caseSelector)
+  const setupNs = process.hrtime.bigint() - setupStart
   const finalRows = []
 
   console.log("JS local benchmark: fixed implementation")
@@ -799,9 +874,12 @@ async function main() {
     `QUOTA_WRITES_PER_WINDOW=${quotaWritesPerWindow}, QUOTA_WINDOW_MS=${quotaWindowMs}, BACKOFF_BASE_MS=${backoffBaseMs}, BACKOFF_MAX_RETRIES=${backoffMaxRetries}` +
     `${batchSweep ? `, BATCH_SWEEP=${batchSweep.join(",")}` : ""}` +
     `${largeRepeat > 1 ? `, LARGE_REPEAT=${largeRepeat}` : ""}` +
-    `${largeElixirRepeat > 1 ? `, LARGE_ELIXIR_REPEAT=${largeElixirRepeat}` : ""}`
+    `${largeElixirRepeat > 1 ? `, LARGE_ELIXIR_REPEAT=${largeElixirRepeat}` : ""}` +
+    `${usePregeneratedRepeat ? ", USE_PREGENERATED_REPEAT=true" : ""}`
   )
   console.log("This uses a local mock (no real Google account / API calls).")
+  console.log(`Setup (load/generate/select) before measured runs: ${formatMs(setupNs)} ms`)
+  printFixtureSizes(selectedCases)
   console.log("Tip: set TRACE=1 to see per-call progress; set ASYNC_DELAY_MS=1 to expose missing await issues.\n")
 
   for (const [caseName, fixture] of Object.entries(selectedCases)) {
