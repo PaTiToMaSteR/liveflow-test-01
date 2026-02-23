@@ -139,13 +139,13 @@ function tryLoadPregeneratedRepeatFixture(sourceCaseName, repeatCount) {
 function addGeneratedLargeCases(allCases, { largeRepeat, largeElixirRepeat, usePregeneratedRepeat }) {
   if (largeRepeat > 1) {
     allCases.large_repeat =
-      (usePregeneratedRepeat && tryLoadPregeneratedRepeatFixture("large", largeRepeat)) ??
+      (usePregeneratedRepeat ? tryLoadPregeneratedRepeatFixture("large", largeRepeat) : null) ??
       repeatFixture(allCases.large, largeRepeat)
   }
 
   if (largeElixirRepeat > 1) {
     allCases.large_elixir_repeat =
-      (usePregeneratedRepeat && tryLoadPregeneratedRepeatFixture("large_elixir", largeElixirRepeat)) ??
+      (usePregeneratedRepeat ? tryLoadPregeneratedRepeatFixture("large_elixir", largeElixirRepeat) : null) ??
       repeatFixture(allCases.large_elixir, largeElixirRepeat)
   }
 }
