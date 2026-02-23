@@ -466,7 +466,10 @@ async function runSingle(label, impl, fixture, runOptions) {
 
   const start = process.hrtime.bigint()
   try {
-    const result = impl(executionApi, spreadsheetId, current, target)
+    const result = impl(executionApi, spreadsheetId, current, target, {
+      maxBatchOps: runOptions.maxBatchOps,
+      maxPayloadBytes: runOptions.maxPayloadBytes,
+    })
     if (isPromiseLike(result)) {
       await result
     }
