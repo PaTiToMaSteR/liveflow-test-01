@@ -75,6 +75,62 @@ function buildCases() {
   }
 }
 
+function maxNonNullId(...dimensions) {
+  let maxId = 0
+  for (const values of dimensions) {
+    for (const value of values) {
+      if (value !== null && value > maxId) {
+        maxId = value
+      }
+    }
+  }
+  return maxId
+}
+
+function repeatDimensionIds(values, repeatCount, idOffset) {
+  const repeated = []
+  for (let repeatIndex = 0; repeatIndex < repeatCount; repeatIndex += 1) {
+    const baseOffset = repeatIndex * idOffset
+    for (const value of values) {
+      repeated.push(value === null ? null : value + baseOffset)
+    }
+  }
+  return repeated
+}
+
+function repeatFixture(fixture, repeatCount) {
+  if (repeatCount <= 1) {
+    return {
+      current: cloneState(fixture.current),
+      target: cloneState(fixture.target),
+    }
+  }
+
+  const columnOffset = maxNonNullId(fixture.current.columns, fixture.target.columns) + 1
+  const rowOffset = maxNonNullId(fixture.current.rows, fixture.target.rows) + 1
+
+  return {
+    current: {
+      columns: repeatDimensionIds(fixture.current.columns, repeatCount, columnOffset),
+      rows: repeatDimensionIds(fixture.current.rows, repeatCount, rowOffset),
+    },
+    target: {
+      columns: repeatDimensionIds(fixture.target.columns, repeatCount, columnOffset),
+      rows: repeatDimensionIds(fixture.target.rows, repeatCount, rowOffset),
+    },
+  }
+}
+
+function addGeneratedLargeCases(allCases, { largeRepeat, largeElixirRepeat }) {
+  if (largeRepeat > 1) {
+    allCases.large_repeat = repeatFixture(allCases.large, largeRepeat)
+  }
+
+  if (largeElixirRepeat > 1) {
+    allCases.large_elixir_repeat = repeatFixture(allCases.large_elixir, largeElixirRepeat)
+  }
+}
+
 function percentile(sortedValues, p) {
   if (sortedValues.length === 0) {
     return 0n
@@ -725,10 +781,13 @@ async function main() {
   const backoffBaseMs = intEnv("BACKOFF_BASE_MS", 50)
   const backoffMaxRetries = intEnv("BACKOFF_MAX_RETRIES", 0)
   const traceBatching = boolEnv("TRACE_BATCHING", false)
+  const largeRepeat = intEnv("LARGE_REPEAT", 0)
+  const largeElixirRepeat = intEnv("LARGE_ELIXIR_REPEAT", 0)
   const batchSweep = parseBatchSweep()
   const implEntries = parseImplementationSelection()
 
   const allCases = buildCases()
+  addGeneratedLargeCases(allCases, { largeRepeat, largeElixirRepeat })
   const selectedCases = selectCases(allCases, caseSelector)
   const finalRows = []
 
@@ -738,7 +797,9 @@ async function main() {
     `TRACE=${trace}, TRACE_CALLS=${traceCallLimit}, PROGRESS_EVERY=${progressEvery}, STRICT_RULES=${strictRules}, ASYNC_DELAY_MS=${asyncDelayMs}, ` +
     `BATCHING=${batchingEnabled}, MAX_BATCH_OPS=${maxBatchOps}, MAX_PAYLOAD_BYTES=${maxPayloadBytes}, ` +
     `QUOTA_WRITES_PER_WINDOW=${quotaWritesPerWindow}, QUOTA_WINDOW_MS=${quotaWindowMs}, BACKOFF_BASE_MS=${backoffBaseMs}, BACKOFF_MAX_RETRIES=${backoffMaxRetries}` +
-    `${batchSweep ? `, BATCH_SWEEP=${batchSweep.join(",")}` : ""}`
+    `${batchSweep ? `, BATCH_SWEEP=${batchSweep.join(",")}` : ""}` +
+    `${largeRepeat > 1 ? `, LARGE_REPEAT=${largeRepeat}` : ""}` +
+    `${largeElixirRepeat > 1 ? `, LARGE_ELIXIR_REPEAT=${largeElixirRepeat}` : ""}`
   )
   console.log("This uses a local mock (no real Google account / API calls).")
   console.log("Tip: set TRACE=1 to see per-call progress; set ASYNC_DELAY_MS=1 to expose missing await issues.\n")
