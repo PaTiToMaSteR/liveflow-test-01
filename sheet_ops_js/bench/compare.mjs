@@ -1149,6 +1149,13 @@ async function main() {
     const results = {}
 
     const batchProfiles = batchSweep ?? [maxBatchOps]
+    if (mockApplyMode === "batch_rebuild" && batchProfiles.includes(1)) {
+      console.log(
+        "Warning: MOCK_APPLY_MODE=batch_rebuild with batch=1 is a pathological benchmark configuration.\n" +
+        "         It rebuilds large arrays for every single op and can take a very long time.\n" +
+        "         Prefer BATCH_SWEEP=500,1000 (and BREAKDOWN=0 for throughput runs)."
+      )
+    }
 
     for (const batchOpsValue of batchProfiles) {
       for (const [label, impl] of implEntries) {
