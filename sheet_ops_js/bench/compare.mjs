@@ -652,7 +652,10 @@ function applyDimensionOpsByRebuild(sourceValues, ops) {
 
   const result = sourceValues.slice(0, tail)
   for (let i = pieces.length - 1; i >= 0; i -= 1) {
-    result.push(...pieces[i])
+    const piece = pieces[i]
+    for (let j = 0; j < piece.length; j += 1) {
+      result.push(piece[j])
+    }
   }
 
   return result
