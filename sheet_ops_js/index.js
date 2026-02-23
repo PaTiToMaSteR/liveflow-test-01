@@ -57,6 +57,19 @@ export default async function updateSpreadsheet(
   }
 }
 
+/**
+ * Stream the ordered operations needed to reconcile one dimension (`row` or
+ * `column`) from `currentIds` to `targetIds`.
+ *
+ * Intent:
+ * - preserve the original reverse-traversal semantics (index-stable ops)
+ * - avoid allocating one giant operations array before execution
+ *
+ * @param {"row" | "column"} dimension Dimension being reconciled.
+ * @param {(number | null)[]} currentIds Current ids for the dimension.
+ * @param {(number | null)[]} targetIds Target ids for the dimension.
+ * @yields {["insert", "row" | "column", number, number] | ["delete", "row" | "column", number]}
+ */
 function *diffDimensionOps(dimension, currentIds, targetIds) {
   // Reverse traversal keeps emitted insert/delete indices stable as ops are
   // applied in order. Streaming via a generator avoids materializing very
@@ -113,6 +126,23 @@ function *diffDimensionOps(dimension, currentIds, targetIds) {
   }
 }
 
+/**
+ * Execute a stream of planned ops in ordered batches, respecting configured
+ * batch-size and payload-size guardrails.
+ *
+ * Intent:
+ * - keep API call count low for real integrations
+ * - preserve operation order exactly (index-sensitive mutations)
+ * - optionally collect benchmark-only timing counters with `profile`
+ *
+ * @param {GoogleSheetsApi} api API adapter used by the challenge solution.
+ * @param {string} spreadsheetId Spreadsheet identifier passed to `performOps`.
+ * @param {Iterable<["insert" | "delete", "row" | "column", number, number?]>} plannedOps
+ *   Stream (or array) of ordered operations to execute.
+ * @param {{ maxBatchOps: number, maxPayloadBytes: number }} executionLimits Normalized batch guardrails.
+ * @param {Record<string, bigint | number> | null} [profile=null] Optional benchmark-only metrics collector.
+ * @returns {Promise<void>}
+ */
 async function executeInBatches(api, spreadsheetId, plannedOps, { maxBatchOps, maxPayloadBytes }, profile = null) {
   // When profiling is enabled, these buckets are intended for diagnosis, not
   // for additive accounting. For example, `apiAwaitNs` includes time spent in
@@ -191,6 +221,17 @@ async function executeInBatches(api, spreadsheetId, plannedOps, { maxBatchOps, m
   }
 }
 
+/**
+ * Normalize caller-provided execution options into validated integers used by
+ * the batching executor.
+ *
+ * Intent:
+ * - keep `updateSpreadsheet` tolerant of missing/invalid tuning values
+ * - centralize defaults/validation in one place
+ *
+ * @param {ExecutionOptions | undefined} executionOptions Optional caller tuning.
+ * @returns {{ maxBatchOps: number, maxPayloadBytes: number }} Normalized execution limits.
+ */
 function normalizeExecutionOptions(executionOptions) {
   return {
     maxBatchOps: normalizePositiveInt(executionOptions.maxBatchOps, DEFAULT_EXECUTION_OPTIONS.maxBatchOps),
@@ -201,6 +242,16 @@ function normalizeExecutionOptions(executionOptions) {
   }
 }
 
+/**
+ * Coerce a value into a positive integer, or fall back when invalid.
+ *
+ * Intent:
+ * - guarantee `maxBatchOps >= 1`
+ *
+ * @param {unknown} value Candidate value from caller input.
+ * @param {number} fallback Default value to use when `value` is invalid.
+ * @returns {number} A positive integer.
+ */
 function normalizePositiveInt(value, fallback) {
   if (!Number.isFinite(value)) {
     return fallback
@@ -208,6 +259,17 @@ function normalizePositiveInt(value, fallback) {
   return Math.max(1, Math.floor(value))
 }
 
+/**
+ * Coerce a value into a non-negative integer, or fall back when invalid.
+ *
+ * Intent:
+ * - allow `0` as a special value to disable payload-size guardrails in local
+ *   benchmarks while keeping production defaults positive
+ *
+ * @param {unknown} value Candidate value from caller input.
+ * @param {number} fallback Default value to use when `value` is invalid.
+ * @returns {number} A non-negative integer.
+ */
 function normalizeNonNegativeInt(value, fallback) {
   if (!Number.isFinite(value)) {
     return fallback
@@ -215,6 +277,17 @@ function normalizeNonNegativeInt(value, fallback) {
   return Math.max(0, Math.floor(value))
 }
 
+/**
+ * Estimate the serialized JSON byte size of a single op tuple without building
+ * a JSON string for every operation.
+ *
+ * Intent:
+ * - keep payload-size batching checks cheap on large workloads
+ * - provide a stable approximation for ASCII-only op tuples
+ *
+ * @param {["insert" | "delete", "row" | "column", number, number?]} op Operation tuple.
+ * @returns {number} Estimated serialized byte size for the op tuple.
+ */
 function estimateOpBytes(op) {
   // Payloads are ASCII-only and op shapes are fixed, so we can estimate JSON
   // size without allocating a string for every operation.
@@ -227,6 +300,15 @@ function estimateOpBytes(op) {
   return base + digitCount(op[2])
 }
 
+/**
+ * Count decimal digits for a non-negative integer.
+ *
+ * Intent:
+ * - support cheap payload-size estimation without string allocations
+ *
+ * @param {number} value Non-negative integer value.
+ * @returns {number} Decimal digit count.
+ */
 function digitCount(value) {
   if (value < 10) {
     return 1
@@ -242,6 +324,16 @@ function digitCount(value) {
   return digits
 }
 
+/**
+ * Check whether a value can be used as the optional benchmark profile
+ * collector.
+ *
+ * Intent:
+ * - keep profiling hooks opt-in and safe to ignore in normal production usage
+ *
+ * @param {unknown} value Candidate profile collector.
+ * @returns {value is Record<string, bigint | number>} True when the value is an object collector.
+ */
 function isProfileCollector(value) {
   return value !== null && typeof value === "object"
 }
