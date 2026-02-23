@@ -1,0 +1,15 @@
+# npm
+node_modules
+yarn-error.log
+
+# build
+dist/
+
+# mac
+.DS_Store
+
+# env
+.env
+.envrc
+
+/tmp
