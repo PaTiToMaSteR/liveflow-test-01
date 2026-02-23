@@ -1,4 +1,4 @@
-import GoogleSheetsApi from "./GoogleSheetsApi"
+import GoogleSheetsApi from "./GoogleSheetsApi.js"
 
 /**
  *
@@ -7,12 +7,12 @@ import GoogleSheetsApi from "./GoogleSheetsApi"
  * @param {Object} current - { columns: (number | null)[]], rows: (number | null)[]}
  * @param {Object} target - { columns: (number | null)[]], rows: (number | null)[]}
  */
-export default function updateSpreadsheet(api, spreadsheetId, current, target) {
-  ops(api, spreadsheetId, "column", current.columns, target.columns)
-  ops(api, spreadsheetId, "row", current.rows, target.rows)
+export default async function updateSpreadsheet(api, spreadsheetId, current, target) {
+  await ops(api, spreadsheetId, "column", current.columns, target.columns)
+  await ops(api, spreadsheetId, "row", current.rows, target.rows)
 }
 
-function ops(api, spreadsheetId, dim, cs, ts) {
+async function ops(api, spreadsheetId, dim, cs, ts) {
   let ic = cs.length - 1
   let it = ts.length - 1
   while (true) {
@@ -22,7 +22,7 @@ function ops(api, spreadsheetId, dim, cs, ts) {
       continue
     }
     if (ic < 0) {
-      api.performOps(spreadsheetId, [["insert", dim, 0, ts[it]]])
+      await api.performOps(spreadsheetId, [["insert", dim, 0, ts[it]]])
       it--
       continue
     }
@@ -31,7 +31,7 @@ function ops(api, spreadsheetId, dim, cs, ts) {
       continue
     }
     if (it < 0) {
-      api.performOps(spreadsheetId, [["delete", dim, ic]])
+      await api.performOps(spreadsheetId, [["delete", dim, ic]])
       ic--
       continue
     }
@@ -41,11 +41,11 @@ function ops(api, spreadsheetId, dim, cs, ts) {
       continue
     }
     if (cs[ic] === null) {
-      api.performOps(spreadsheetId, [["insert", dim, ic + 1, ts[it]]])
+      await api.performOps(spreadsheetId, [["insert", dim, ic + 1, ts[it]]])
       it--
       continue
     }
-    api.performOps(spreadsheetId, [["delete", dim, ic]])
+    await api.performOps(spreadsheetId, [["delete", dim, ic]])
     ic--
   }
 }

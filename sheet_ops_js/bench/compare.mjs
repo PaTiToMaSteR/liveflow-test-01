@@ -1,0 +1,801 @@
+import assert from "node:assert/strict"
+import fs from "node:fs"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
+import GoogleSheetsApi from "../GoogleSheetsApi.js"
+import updateSpreadsheet from "../index.js"
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const projectRoot = path.resolve(__dirname, "..")
+
+const IMPLEMENTATIONS = {
+  fixed: updateSpreadsheet,
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function cloneState(state) {
+  return {
+    columns: [...state.columns],
+    rows: [...state.rows],
+  }
+}
+
+function loadLargeFixture(name) {
+  return JSON.parse(fs.readFileSync(path.join(projectRoot, "__tests__", "data", name), "utf8"))
+}
+
+function loadElixirFixture(name) {
+  return JSON.parse(
+    fs.readFileSync(path.join(projectRoot, "..", "sheet_ops_ex", "test", "data", name), "utf8")
+  )
+}
+
+function buildCases() {
+  return {
+    empty: {
+      current: { columns: [], rows: [] },
+      target: { columns: [], rows: [] },
+    },
+    nulls: {
+      current: { columns: [null, null, null], rows: [null, null, null] },
+      target: { columns: [null, null, null], rows: [null, null, null] },
+    },
+    example1: {
+      current: {
+        columns: [14, null, null, null, 12, 7, 4, 13, 6, null],
+        rows: [15, 14, 13, null, 8, 11, null, 7, 12, 2, null, null, 9]
+      },
+      target: {
+        columns: [null, null, 11, 14, null, 4, null, 9, 13, 5, 7, 3],
+        rows: [9, 12, 3, 13, null, null, 4, 8, 5, null, 6, null, 10]
+      }
+    },
+    example2: {
+      current: {
+        columns: [8, 7, 15, null, 11, 13, 2],
+        rows: [null, 2, 6, 7, 8, 1, 5]
+      },
+      target: {
+        columns: [4, 5, null, 2, 6, 1, 8, 7],
+        rows: [8, 6, 5, 7, 4, null, 1]
+      }
+    },
+    large: {
+      current: loadLargeFixture("large_current.json"),
+      target: loadLargeFixture("large_target.json"),
+    },
+    large_elixir: {
+      current: loadElixirFixture("large_current.json"),
+      target: loadElixirFixture("large_target.json"),
+    }
+  }
+}
+
+function percentile(sortedValues, p) {
+  if (sortedValues.length === 0) {
+    return 0n
+  }
+
+  const lastIndex = sortedValues.length - 1
+  const index = Math.floor((lastIndex * p) / 100)
+  return sortedValues[index]
+}
+
+function formatMs(ns) {
+  return (Number(ns) / 1_000_000).toFixed(3)
+}
+
+function safeStringify(value) {
+  return JSON.stringify(value)
+}
+
+function summarizeDimensionDistance(actual, target) {
+  const maxLen = Math.max(actual.length, target.length)
+  let positionalMismatches = 0
+  let firstMismatch = null
+
+  for (let i = 0; i < maxLen; i += 1) {
+    const actualValue = actual[i]
+    const targetValue = target[i]
+    if (actualValue !== targetValue) {
+      positionalMismatches += 1
+      if (firstMismatch === null) {
+        firstMismatch = { index: i, actual: actualValue, target: targetValue }
+      }
+    }
+  }
+
+  return {
+    lengthActual: actual.length,
+    lengthTarget: target.length,
+    lengthDelta: actual.length - target.length,
+    positionalMismatches,
+    firstMismatch,
+  }
+}
+
+function summarizeDistance(actualState, targetState) {
+  const columns = summarizeDimensionDistance(actualState.columns, targetState.columns)
+  const rows = summarizeDimensionDistance(actualState.rows, targetState.rows)
+
+  return {
+    score: columns.positionalMismatches + rows.positionalMismatches,
+    columns,
+    rows,
+  }
+}
+
+function formatDistanceSummary(distance) {
+  return [
+    `columns: mismatches=${distance.columns.positionalMismatches}, lenDelta=${distance.columns.lengthDelta}, first=${mismatchText(distance.columns.firstMismatch)}`,
+    `rows: mismatches=${distance.rows.positionalMismatches}, lenDelta=${distance.rows.lengthDelta}, first=${mismatchText(distance.rows.firstMismatch)}`
+  ].join("; ")
+}
+
+function mismatchText(mismatch) {
+  if (!mismatch) {
+    return "none"
+  }
+
+  return `[${mismatch.index}] actual=${safeStringify(mismatch.actual)} target=${safeStringify(mismatch.target)}`
+}
+
+function parseOp([action, dimension, index, value]) {
+  return {
+    action,
+    dimension,
+    index,
+    value,
+  }
+}
+
+function describeOps(ops) {
+  return ops
+    .map(([action, dimension, index, value]) => {
+      if (action === "insert") {
+        return `${action} ${dimension} @${index}=${safeStringify(value)}`
+      }
+      return `${action} ${dimension} @${index}`
+    })
+    .join(" | ")
+}
+
+class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
+  constructor({ label, targetState, trace = false, traceCallLimit = 15, progressEvery = 0, strictRules = false, asyncDelayMs = 0 }) {
+    super()
+    this.label = label
+    this.targetState = cloneState(targetState)
+    this.trace = trace
+    this.traceCallLimit = traceCallLimit
+    this.progressEvery = progressEvery
+    this.strictRules = strictRules
+    this.asyncDelayMs = asyncDelayMs
+
+    this.spreadsheets = {}
+    this.opsCount = 0
+    this.apiCallCount = 0
+    this.maxBatchSize = 0
+    this._pending = new Set()
+  }
+
+  addSpreadsheet(spreadsheetId, { columns, rows }) {
+    this.spreadsheets[spreadsheetId] = {
+      columns: [...columns],
+      rows: [...rows],
+    }
+  }
+
+  fetchSpreadsheetState(spreadsheetId) {
+    const spreadsheet = this.spreadsheets[spreadsheetId]
+    if (!spreadsheet) {
+      throw new Error(`Spreadsheet ${spreadsheetId} not found`)
+    }
+    return spreadsheet
+  }
+
+  async drainPending() {
+    while (this._pending.size > 0) {
+      await Promise.allSettled([...this._pending])
+    }
+  }
+
+  performOps(spreadsheetId, ops) {
+    this.apiCallCount += 1
+    this.maxBatchSize = Math.max(this.maxBatchSize, ops.length)
+
+    if (this.asyncDelayMs > 0) {
+      const promise = (async () => {
+        await sleep(this.asyncDelayMs)
+        this.#applyOps(spreadsheetId, ops)
+      })()
+
+      this.#trackPending(promise)
+      return promise
+    }
+
+    this.#applyOps(spreadsheetId, ops)
+    return Promise.resolve()
+  }
+
+  #trackPending(promise) {
+    this._pending.add(promise)
+    promise.finally(() => {
+      this._pending.delete(promise)
+    })
+  }
+
+  #applyOps(spreadsheetId, ops) {
+    const spreadsheet = this.fetchSpreadsheetState(spreadsheetId)
+
+    for (const rawOp of ops) {
+      const op = parseOp(rawOp)
+      this.#validateOp(spreadsheet, op)
+      this.#applySingleOp(spreadsheet, op)
+      this.opsCount += 1
+    }
+
+    this.#maybeLogProgress(spreadsheetId, ops)
+  }
+
+  #validateOp(spreadsheet, op) {
+    if (!this.strictRules) {
+      return
+    }
+
+    const values = spreadsheet[op.dimension + "s"]
+
+    if (op.action === "insert" && op.value === null) {
+      throw new Error(`Invalid insert: ${op.dimension} id cannot be null (index=${op.index})`)
+    }
+
+    if (op.action === "delete" && values[op.index] === null) {
+      throw new Error(`Invalid delete: cannot delete user-defined ${op.dimension} at index ${op.index}`)
+    }
+  }
+
+  #applySingleOp(spreadsheet, op) {
+    switch (op.action) {
+      case "delete":
+        spreadsheet[op.dimension + "s"].splice(op.index, 1)
+        return
+      case "insert":
+        spreadsheet[op.dimension + "s"].splice(op.index, 0, op.value)
+        return
+      default:
+        throw new Error(`Unknown action: ${op.action}`)
+    }
+  }
+
+  #maybeLogProgress(spreadsheetId, ops) {
+    const shouldTrace = this.trace && this.apiCallCount <= this.traceCallLimit
+    const shouldCheckpoint = this.progressEvery > 0 && this.apiCallCount % this.progressEvery === 0
+
+    if (!shouldTrace && !shouldCheckpoint) {
+      return
+    }
+
+    const state = this.fetchSpreadsheetState(spreadsheetId)
+    const distance = summarizeDistance(state, this.targetState)
+    const prefix = `[${this.label}] call=${this.apiCallCount} opsTotal=${this.opsCount}`
+
+    if (shouldTrace) {
+      console.log(`${prefix} | ${describeOps(ops)}`)
+      console.log(`      progress: ${formatDistanceSummary(distance)}`)
+      return
+    }
+
+    console.log(`${prefix} checkpoint | ${formatDistanceSummary(distance)}`)
+  }
+}
+
+class BatchingQuotaApi {
+  constructor(innerApi, options = {}) {
+    this.innerApi = innerApi
+    this.maxBatchOps = options.maxBatchOps || 1
+    this.maxPayloadBytes = options.maxPayloadBytes || 0
+    this.quotaWritesPerWindow = options.quotaWritesPerWindow || 0
+    this.quotaWindowMs = options.quotaWindowMs || 60_000
+    this.backoffBaseMs = options.backoffBaseMs || 50
+    this.backoffMaxRetries = options.backoffMaxRetries || 0
+    this.traceBatching = Boolean(options.traceBatching)
+
+    this.pendingOps = []
+    this.pendingPayloadBytes = 0
+    this.windowStartedAt = Date.now()
+    this.windowWrites = 0
+
+    this.bufferedCalls = 0
+    this.flushCount = 0
+    this.retryCount = 0
+    this.throttle429Count = 0
+    this.totalBackoffMs = 0
+    this.maxFlushPayloadBytes = 0
+    this.totalBatchProcessingNs = 0n
+  }
+
+  async performOps(spreadsheetId, ops) {
+    this.bufferedCalls += 1
+
+    for (const op of ops) {
+      const opBytes = estimateOpBytes(op)
+      const wouldExceedBatchOps = this.maxBatchOps > 0 && this.pendingOps.length >= this.maxBatchOps
+      const wouldExceedPayload =
+        this.maxPayloadBytes > 0 &&
+        this.pendingOps.length > 0 &&
+        this.pendingPayloadBytes + opBytes > this.maxPayloadBytes
+
+      if (wouldExceedBatchOps || wouldExceedPayload) {
+        await this.flush(spreadsheetId)
+      }
+
+      this.pendingOps.push(op)
+      this.pendingPayloadBytes += opBytes
+    }
+  }
+
+  async flush(spreadsheetId) {
+    if (this.pendingOps.length === 0) {
+      return
+    }
+
+    const batch = this.pendingOps
+    const payloadBytes = this.pendingPayloadBytes
+    this.pendingOps = []
+    this.pendingPayloadBytes = 0
+
+    this.maxFlushPayloadBytes = Math.max(this.maxFlushPayloadBytes, payloadBytes)
+
+    if (this.traceBatching) {
+      console.log(
+        `[batching] flushing batch ops=${batch.length} estBytes=${payloadBytes} bufferedCalls=${this.bufferedCalls}`
+      )
+    }
+
+    let attempt = 0
+    while (true) {
+      try {
+        this.#consumeQuota()
+        this.flushCount += 1
+        const batchStart = process.hrtime.bigint()
+        await this.innerApi.performOps(spreadsheetId, batch)
+        this.totalBatchProcessingNs += process.hrtime.bigint() - batchStart
+        return
+      } catch (error) {
+        if (!isQuotaError(error) || attempt >= this.backoffMaxRetries) {
+          throw error
+        }
+
+        this.retryCount += 1
+        this.throttle429Count += 1
+        const delayMs = this.backoffBaseMs * (2 ** attempt)
+        this.totalBackoffMs += delayMs
+
+        if (this.traceBatching) {
+          console.log(
+            `[batching] 429 retry attempt=${attempt + 1}/${this.backoffMaxRetries} delayMs=${delayMs}`
+          )
+        }
+
+        await sleep(delayMs)
+        attempt += 1
+      }
+    }
+  }
+
+  async drainPending(spreadsheetId) {
+    await this.flush(spreadsheetId)
+    if (typeof this.innerApi.drainPending === "function") {
+      await this.innerApi.drainPending()
+    }
+  }
+
+  #consumeQuota() {
+    if (this.quotaWritesPerWindow <= 0) {
+      return
+    }
+
+    const now = Date.now()
+    if (now - this.windowStartedAt >= this.quotaWindowMs) {
+      this.windowStartedAt = now
+      this.windowWrites = 0
+    }
+
+    if (this.windowWrites >= this.quotaWritesPerWindow) {
+      const error = new Error("429 Too Many Requests (simulated write quota)")
+      error.code = 429
+      error.status = 429
+      throw error
+    }
+
+    this.windowWrites += 1
+  }
+}
+
+function estimateOpBytes(op) {
+  return Buffer.byteLength(JSON.stringify(op), "utf8")
+}
+
+function isQuotaError(error) {
+  return error?.status === 429 || error?.code === 429 || /429/.test(String(error?.message))
+}
+
+function isPromiseLike(value) {
+  return value !== null && typeof value === "object" && typeof value.then === "function"
+}
+
+function assertStateEquals(actual, expected, label) {
+  try {
+    assert.deepStrictEqual(actual, expected)
+    return null
+  } catch (error) {
+    return new Error(`${label}: final state mismatch`)
+  }
+}
+
+async function runSingle(label, impl, fixture, runOptions) {
+  const mock = new InstrumentedGoogleSheetsApiMock({
+    label,
+    targetState: fixture.target,
+    trace: runOptions.trace,
+    traceCallLimit: runOptions.traceCallLimit,
+    progressEvery: runOptions.progressEvery,
+    strictRules: runOptions.strictRules,
+    asyncDelayMs: runOptions.asyncDelayMs,
+  })
+
+  const spreadsheetId = "bench"
+  const current = cloneState(fixture.current)
+  const target = cloneState(fixture.target)
+  const executionApi = runOptions.batchingEnabled
+    ? new BatchingQuotaApi(mock, {
+      maxBatchOps: runOptions.maxBatchOps,
+      maxPayloadBytes: runOptions.maxPayloadBytes,
+      quotaWritesPerWindow: runOptions.quotaWritesPerWindow,
+      quotaWindowMs: runOptions.quotaWindowMs,
+      backoffBaseMs: runOptions.backoffBaseMs,
+      backoffMaxRetries: runOptions.backoffMaxRetries,
+      traceBatching: runOptions.traceBatching,
+    })
+    : mock
+
+  mock.addSpreadsheet(spreadsheetId, current)
+
+  const start = process.hrtime.bigint()
+  try {
+    const result = impl(executionApi, spreadsheetId, current, target)
+    if (isPromiseLike(result)) {
+      await result
+    }
+    if (runOptions.batchingEnabled) {
+      await executionApi.drainPending?.(spreadsheetId)
+    }
+  } catch (error) {
+    await executionApi.drainPending?.(spreadsheetId)
+    throw new Error(`${label} threw during execution: ${error.message}`)
+  }
+  const elapsedNs = process.hrtime.bigint() - start
+
+  const immediateState = cloneState(mock.fetchSpreadsheetState(spreadsheetId))
+  const mismatchError = assertStateEquals(immediateState, fixture.target, label)
+
+  if (mismatchError) {
+    let drainsToTarget = false
+    try {
+      await executionApi.drainPending?.(spreadsheetId)
+      const drainedState = cloneState(mock.fetchSpreadsheetState(spreadsheetId))
+      drainsToTarget = assertStateEquals(drainedState, fixture.target, label) === null
+    } catch (error) {
+      throw new Error(`${label} failed while draining pending API calls: ${error.message}`)
+    }
+
+    const distance = summarizeDistance(immediateState, fixture.target)
+    const detail = `distance(${formatDistanceSummary(distance)})`
+
+    if (runOptions.asyncDelayMs > 0 && drainsToTarget) {
+      throw new Error(
+        `${label} appears to rely on synchronous side effects from api.performOps(). ` +
+        `With ASYNC_DELAY_MS=${runOptions.asyncDelayMs}, the state is wrong when the function returns but becomes correct after pending calls finish. ` +
+        `This usually means missing await/async handling. ${detail}`
+      )
+    }
+
+    throw new Error(`${label} produced a wrong final state. ${detail}`)
+  }
+
+  if (!runOptions.batchingEnabled) {
+    await executionApi.drainPending?.(spreadsheetId)
+  }
+
+  const batchingStats = executionApi instanceof BatchingQuotaApi
+    ? {
+      bufferedCalls: executionApi.bufferedCalls,
+      flushCount: executionApi.flushCount,
+      retryCount: executionApi.retryCount,
+      throttle429Count: executionApi.throttle429Count,
+      totalBackoffMs: executionApi.totalBackoffMs,
+      maxFlushPayloadBytes: executionApi.maxFlushPayloadBytes,
+      totalBatchProcessingNs: executionApi.totalBatchProcessingNs,
+    }
+    : null
+
+  return {
+    elapsedNs,
+    opsCount: mock.opsCount,
+    apiCalls: mock.apiCallCount,
+    maxBatchSize: mock.maxBatchSize,
+    batchingStats,
+  }
+}
+
+async function runBenchmarkForImplementation(label, impl, fixture, options) {
+  console.log(`  [${label}] warmup (${options.warmup})...`)
+  for (let i = 0; i < options.warmup; i += 1) {
+    await runSingle(label, impl, fixture, { ...options, trace: false })
+    console.log(`    warmup ${i + 1}/${options.warmup}`)
+  }
+
+  console.log(`  [${label}] measured runs (${options.iterations})...`)
+  const samples = []
+
+  for (let i = 0; i < options.iterations; i += 1) {
+    const sample = await runSingle(label, impl, fixture, {
+      ...options,
+      trace: options.trace && i === 0,
+    })
+
+    samples.push(sample)
+    console.log(
+      `    run ${i + 1}/${options.iterations} - ${formatMs(sample.elapsedNs)} ms, ops=${sample.opsCount}, calls=${sample.apiCalls}, maxBatch=${sample.maxBatchSize}` +
+      formatBatchingStatsInline(sample.batchingStats)
+    )
+  }
+
+  const times = samples.map((s) => s.elapsedNs).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const uniqueOpsCounts = [...new Set(samples.map((s) => s.opsCount))]
+  const uniqueApiCalls = [...new Set(samples.map((s) => s.apiCalls))]
+  const uniqueBatchSizes = [...new Set(samples.map((s) => s.maxBatchSize))]
+  const uniqueFlushCounts = [...new Set(samples.map((s) => s.batchingStats?.flushCount).filter((v) => v !== undefined))]
+  const uniqueRetryCounts = [...new Set(samples.map((s) => s.batchingStats?.retryCount).filter((v) => v !== undefined))]
+  const unique429Counts = [...new Set(samples.map((s) => s.batchingStats?.throttle429Count).filter((v) => v !== undefined))]
+  const batchProcessingTimes = samples
+    .map((s) => s.batchingStats?.totalBatchProcessingNs)
+    .filter((v) => v !== undefined)
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+
+  return {
+    label,
+    iterations: options.iterations,
+    times,
+    uniqueOpsCounts,
+    uniqueApiCalls,
+    uniqueBatchSizes,
+    uniqueFlushCounts,
+    uniqueRetryCounts,
+    unique429Counts,
+    batchProcessingTimes,
+  }
+}
+
+function formatBatchingStatsInline(stats) {
+  if (!stats) {
+    return ""
+  }
+
+  return `, flushes=${stats.flushCount}, retries=${stats.retryCount}, quota429=${stats.throttle429Count}, maxFlushBytes=${stats.maxFlushPayloadBytes}`
+}
+
+function summarizeResult(result) {
+  const totalNs = result.times.reduce((acc, ns) => acc + ns, 0n)
+  return {
+    minMs: formatMs(result.times[0]),
+    medianMs: formatMs(percentile(result.times, 50)),
+    totalMs: formatMs(totalNs),
+    batchMs: result.batchProcessingTimes?.length ? formatMs(result.batchProcessingTimes.reduce((acc, ns) => acc + ns, 0n)) : "-",
+    p95Ms: formatMs(percentile(result.times, 95)),
+    maxMs: formatMs(result.times[result.times.length - 1]),
+    opsCounts: result.uniqueOpsCounts,
+    apiCalls: result.uniqueApiCalls,
+    maxBatchSizes: result.uniqueBatchSizes,
+    flushCounts: result.uniqueFlushCounts,
+    retryCounts: result.uniqueRetryCounts,
+    quota429Counts: result.unique429Counts,
+  }
+}
+
+function printFinalTable(rows) {
+  if (rows.length === 0) {
+    return
+  }
+
+  const headers = ["case", "impl", "ops", "calls", "maxBatch", "flushes", "retries", "429s", "medianMs", "totalMs", "batchMs"]
+  const tableRows = rows.map((row) => [
+    row.caseName,
+    row.impl,
+    String(row.ops),
+    String(row.calls),
+    String(row.maxBatch),
+    String(row.flushes),
+    String(row.retries),
+    String(row.quota429),
+    row.medianMs,
+    row.totalMs,
+    row.batchMs,
+  ])
+
+  const widths = headers.map((header, i) =>
+    Math.max(header.length, ...tableRows.map((r) => r[i].length))
+  )
+
+  const fmt = (cells) => cells.map((c, i) => c.padEnd(widths[i])).join(" | ")
+  const sep = widths.map((w) => "-".repeat(w)).join("-|-")
+
+  console.log("\nFinal Comparison Table")
+  console.log(fmt(headers))
+  console.log(sep)
+  for (const row of tableRows) {
+    console.log(fmt(row))
+  }
+}
+
+function selectCases(allCases, caseSelector) {
+  if (caseSelector === "all") {
+    return allCases
+  }
+
+  const fixture = allCases[caseSelector]
+  if (!fixture) {
+    throw new Error(`Unknown CASE=${caseSelector}. Valid values: ${Object.keys(allCases).join(", ")}, all`)
+  }
+
+  return { [caseSelector]: fixture }
+}
+
+function intEnv(name, defaultValue) {
+  const raw = process.env[name]
+  if (raw === undefined) {
+    return defaultValue
+  }
+
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer`)
+  }
+
+  return parsed
+}
+
+function boolEnv(name, defaultValue = false) {
+  const raw = process.env[name]
+  if (raw === undefined) {
+    return defaultValue
+  }
+
+  return ["1", "true", "yes", "on"].includes(raw.toLowerCase())
+}
+
+function parseImplementationSelection() {
+  const raw = process.env.IMPL ?? "fixed"
+
+  if (!IMPLEMENTATIONS[raw]) {
+    throw new Error(`Unknown IMPL=${raw}. Valid values: ${Object.keys(IMPLEMENTATIONS).join(", ")}`)
+  }
+
+  return [[raw, IMPLEMENTATIONS[raw]]]
+}
+
+function parseBatchSweep() {
+  const raw = process.env.BATCH_SWEEP
+  if (!raw) {
+    return null
+  }
+
+  const values = raw
+    .split(",")
+    .map((v) => Number.parseInt(v.trim(), 10))
+    .filter((v) => Number.isFinite(v) && v > 0)
+
+  if (values.length === 0) {
+    throw new Error("BATCH_SWEEP must contain one or more positive integers, e.g. '1,500'")
+  }
+
+  return [...new Set(values)]
+}
+
+async function main() {
+  const warmup = intEnv("WARMUP", 1)
+  const iterations = intEnv("ITERATIONS", 3)
+  const caseSelector = process.env.CASE ?? "example2"
+  const trace = boolEnv("TRACE", false)
+  const traceCallLimit = intEnv("TRACE_CALLS", 15)
+  const progressEvery = intEnv("PROGRESS_EVERY", 0)
+  const strictRules = boolEnv("STRICT_RULES", false)
+  const asyncDelayMs = intEnv("ASYNC_DELAY_MS", 0)
+  const batchingEnabled = boolEnv("BATCHING", false)
+  const maxBatchOps = intEnv("MAX_BATCH_OPS", 100)
+  const maxPayloadBytes = intEnv("MAX_PAYLOAD_BYTES", 0)
+  const quotaWritesPerWindow = intEnv("QUOTA_WRITES_PER_WINDOW", 0)
+  const quotaWindowMs = intEnv("QUOTA_WINDOW_MS", 60_000)
+  const backoffBaseMs = intEnv("BACKOFF_BASE_MS", 50)
+  const backoffMaxRetries = intEnv("BACKOFF_MAX_RETRIES", 0)
+  const traceBatching = boolEnv("TRACE_BATCHING", false)
+  const batchSweep = parseBatchSweep()
+  const implEntries = parseImplementationSelection()
+
+  const allCases = buildCases()
+  const selectedCases = selectCases(allCases, caseSelector)
+  const finalRows = []
+
+  console.log("JS local benchmark: fixed implementation")
+  console.log(
+    `Config: CASE=${caseSelector}, IMPL=${process.env.IMPL ?? "fixed"}, WARMUP=${warmup}, ITERATIONS=${iterations}, ` +
+    `TRACE=${trace}, TRACE_CALLS=${traceCallLimit}, PROGRESS_EVERY=${progressEvery}, STRICT_RULES=${strictRules}, ASYNC_DELAY_MS=${asyncDelayMs}, ` +
+    `BATCHING=${batchingEnabled}, MAX_BATCH_OPS=${maxBatchOps}, MAX_PAYLOAD_BYTES=${maxPayloadBytes}, ` +
+    `QUOTA_WRITES_PER_WINDOW=${quotaWritesPerWindow}, QUOTA_WINDOW_MS=${quotaWindowMs}, BACKOFF_BASE_MS=${backoffBaseMs}, BACKOFF_MAX_RETRIES=${backoffMaxRetries}` +
+    `${batchSweep ? `, BATCH_SWEEP=${batchSweep.join(",")}` : ""}`
+  )
+  console.log("This uses a local mock (no real Google account / API calls).")
+  console.log("Tip: set TRACE=1 to see per-call progress; set ASYNC_DELAY_MS=1 to expose missing await issues.\n")
+
+  for (const [caseName, fixture] of Object.entries(selectedCases)) {
+    console.log(`Running case '${caseName}'`)
+
+    const results = {}
+
+    const batchProfiles = batchSweep ?? [maxBatchOps]
+
+    for (const batchOpsValue of batchProfiles) {
+      for (const [label, impl] of implEntries) {
+        const resultKey = batchSweep ? `${label}@batch${batchOpsValue}` : label
+        const labelForRun = batchSweep ? `${label} (batch=${batchOpsValue})` : label
+
+        results[resultKey] = await runBenchmarkForImplementation(labelForRun, impl, fixture, {
+          warmup,
+          iterations,
+          trace,
+          traceCallLimit,
+          progressEvery,
+          strictRules,
+          asyncDelayMs,
+          batchingEnabled,
+          maxBatchOps: batchOpsValue,
+          maxPayloadBytes,
+          quotaWritesPerWindow,
+          quotaWindowMs,
+          backoffBaseMs,
+          backoffMaxRetries,
+          traceBatching,
+        })
+      }
+    }
+
+    console.log(`\nCase: ${caseName}`)
+    for (const [resultKey, resultValue] of Object.entries(results)) {
+      const s = summarizeResult(resultValue)
+      console.log(`  ${resultKey} summary: ${JSON.stringify(s)}`)
+      finalRows.push({
+        caseName,
+        impl: resultKey,
+        ops: s.opsCounts.join("/"),
+        calls: s.apiCalls.join("/"),
+        maxBatch: s.maxBatchSizes.join("/"),
+        flushes: (s.flushCounts?.length ? s.flushCounts.join("/") : "-"),
+        retries: (s.retryCounts?.length ? s.retryCounts.join("/") : "-"),
+        quota429: (s.quota429Counts?.length ? s.quota429Counts.join("/") : "-"),
+        medianMs: s.medianMs,
+        totalMs: s.totalMs,
+        batchMs: s.batchMs,
+      })
+    }
+
+    console.log("")
+  }
+
+  printFinalTable(finalRows)
+  console.log("Done.")
+}
+
+await main()
