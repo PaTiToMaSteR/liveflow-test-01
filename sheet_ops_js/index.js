@@ -8,12 +8,19 @@ const DEFAULT_EXECUTION_OPTIONS = Object.freeze({
 })
 
 /**
+ * @typedef {{ columns: (number | null)[], rows: (number | null)[] }} SpreadsheetState
+ * @typedef {{ maxBatchOps?: number, maxPayloadBytes?: number }} ExecutionOptions
+ */
+
+/**
+ * Update columns first, then rows, preserving the challenge contract while
+ * batching API calls for better real-world behavior.
  *
  * @param {GoogleSheetsApi} api
  * @param {string} spreadsheetId
- * @param {Object} current - { columns: (number | null)[]], rows: (number | null)[]}
- * @param {Object} target - { columns: (number | null)[]], rows: (number | null)[]}
- * @param {Object} [executionOptions] - Optional local execution tuning.
+ * @param {SpreadsheetState} current
+ * @param {SpreadsheetState} target
+ * @param {ExecutionOptions} [executionOptions] Optional execution tuning.
  */
 export default async function updateSpreadsheet(
   api,
@@ -23,21 +30,23 @@ export default async function updateSpreadsheet(
   executionOptions = {}
 ) {
   const execOptions = normalizeExecutionOptions(executionOptions)
+  // Dimension order matters because row/column indices are independent and the
+  // challenge examples/process assume the two passes are executed separately.
   const dimensions = [
     ["column", current.columns, target.columns],
     ["row", current.rows, target.rows],
   ]
 
-  for (const [dim, currentIds, targetIds] of dimensions) {
-    const plannedOps = diffDimension(dim, currentIds, targetIds)
+  for (const [dimension, currentIds, targetIds] of dimensions) {
+    const plannedOps = diffDimension(dimension, currentIds, targetIds)
     await executeInBatches(api, spreadsheetId, plannedOps, execOptions)
   }
 }
 
-function diffDimension(dim, currentIds, targetIds) {
+function diffDimension(dimension, currentIds, targetIds) {
   // Reverse traversal keeps emitted insert/delete indices stable as ops are
   // applied in order. This is the same invariant as the original algorithm.
-  const ops = []
+  const plannedOps = []
   let currentIdx = currentIds.length - 1
   let targetIdx = targetIds.length - 1
 
@@ -60,7 +69,7 @@ function diffDimension(dim, currentIds, targetIds) {
     }
 
     if (currentIdx < 0) {
-      ops.push(["insert", dim, 0, targetId])
+      plannedOps.push(["insert", dimension, 0, targetId])
       targetIdx--
       continue
     }
@@ -69,7 +78,7 @@ function diffDimension(dim, currentIds, targetIds) {
     // user-defined placeholders (`null`) which we never delete.
     if (targetIdx < 0) {
       if (currentId !== null) {
-        ops.push(["delete", dim, currentIdx])
+        plannedOps.push(["delete", dimension, currentIdx])
       }
       currentIdx--
       continue
@@ -78,27 +87,31 @@ function diffDimension(dim, currentIds, targetIds) {
     // `null` is a user placeholder. We cannot delete it, so we insert the
     // target id around it and let future iterations align placeholders.
     if (currentId === null) {
-      ops.push(["insert", dim, currentIdx + 1, targetId])
+      plannedOps.push(["insert", dimension, currentIdx + 1, targetId])
       targetIdx--
       continue
     }
 
-    ops.push(["delete", dim, currentIdx])
+    // Mismatch on a real id: preserve original behavior and delete from the
+    // current sequence, then continue reconciling at the same target index.
+    plannedOps.push(["delete", dimension, currentIdx])
     currentIdx--
   }
 
-  return ops
+  return plannedOps
 }
 
-async function executeInBatches(api, spreadsheetId, allOps, { maxBatchOps, maxPayloadBytes }) {
+async function executeInBatches(api, spreadsheetId, plannedOps, { maxBatchOps, maxPayloadBytes }) {
   let batch = []
   let batchBytes = 0
 
-  for (const op of allOps) {
+  for (const op of plannedOps) {
     const opBytes = estimateOpBytes(op)
     const batchFull = batch.length >= maxBatchOps
-    const payloadFull = maxPayloadBytes > 0 && batch.length > 0 && batchBytes + opBytes > maxPayloadBytes
+    const payloadFull =
+      maxPayloadBytes > 0 && batch.length > 0 && batchBytes + opBytes > maxPayloadBytes
 
+    // Flush before adding the next op when either guardrail would be exceeded.
     if (batchFull || payloadFull) {
       await api.performOps(spreadsheetId, batch)
       batch = []
@@ -110,6 +123,7 @@ async function executeInBatches(api, spreadsheetId, allOps, { maxBatchOps, maxPa
   }
 
   if (batch.length > 0) {
+    // Preserve operation order: the final partial batch must be flushed last.
     await api.performOps(spreadsheetId, batch)
   }
 }
