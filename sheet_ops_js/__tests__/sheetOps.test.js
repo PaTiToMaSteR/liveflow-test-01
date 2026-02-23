@@ -49,6 +49,20 @@ test("example 2", async () => {
   expect(opsCount).toBeLessThanOrEqual(23)
 })
 
+test("moved item remains correct", async () => {
+  const current = {
+    columns: [1, 2, 3, 4],
+    rows: [],
+  }
+  const target = {
+    columns: [2, 3, 4, 1],
+    rows: [],
+  }
+  const {state, opsCount} = await simulate(current, target)
+  expect(state).toStrictEqual(target)
+  expect(opsCount).toBeLessThanOrEqual(6)
+})
+
 test("large sheet", async () => {
   const current = JSON.parse(fs.readFileSync('./__tests__/data/large_current.json'))
   const target = JSON.parse(fs.readFileSync('./__tests__/data/large_target.json'))

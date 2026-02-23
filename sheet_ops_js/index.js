@@ -22,126 +22,120 @@ export default async function updateSpreadsheet(
   target,
   executionOptions = {}
 ) {
-  const executor = new BatchedOpsExecutor(api, spreadsheetId, executionOptions)
+  const execOptions = normalizeExecutionOptions(executionOptions)
+  const dimensions = [
+    ["column", current.columns, target.columns],
+    ["row", current.rows, target.rows],
+  ]
 
-  await syncDimension(executor, "column", current.columns, target.columns)
-  // Keep dimension boundaries explicit for readability and easier debugging.
-  await executor.flush()
-
-  await syncDimension(executor, "row", current.rows, target.rows)
-  await executor.flush()
-}
-
-async function syncDimension(executor, dim, currentIds, targetIds) {
-  // The algorithm traverses from the end so insert/delete indexes are emitted
-  // in a way that remains valid as prior operations are applied in order.
-  let ic = currentIds.length - 1
-  let it = targetIds.length - 1
-
-  while (true) {
-    if (ic < 0 && it < 0) {
-      return
-    }
-
-    // `null` represents a user-defined row/column placeholder. We never insert
-    // or delete null IDs; we only skip past them while reconciling.
-    if (ic < 0 && targetIds[it] === null) {
-      it--
-      continue
-    }
-
-    if (ic < 0) {
-      await executor.insert(dim, 0, targetIds[it])
-      it--
-      continue
-    }
-
-    if (currentIds[ic] === null && it < 0) {
-      ic--
-      continue
-    }
-
-    if (it < 0) {
-      await executor.delete(dim, ic)
-      ic--
-      continue
-    }
-
-    if (currentIds[ic] === targetIds[it]) {
-      ic--
-      it--
-      continue
-    }
-
-    if (currentIds[ic] === null) {
-      await executor.insert(dim, ic + 1, targetIds[it])
-      it--
-      continue
-    }
-
-    await executor.delete(dim, ic)
-    ic--
+  for (const [dim, currentIds, targetIds] of dimensions) {
+    const plannedOps = diffDimension(dim, currentIds, targetIds)
+    await executeInBatches(api, spreadsheetId, plannedOps, execOptions)
   }
 }
 
-class BatchedOpsExecutor {
-  /**
-   * @param {GoogleSheetsApi} api
-   * @param {string} spreadsheetId
-   * @param {{ maxBatchOps?: number, maxPayloadBytes?: number }} executionOptions
-   */
-  constructor(api, spreadsheetId, executionOptions = {}) {
-    this.api = api
-    this.spreadsheetId = spreadsheetId
+function diffDimension(dim, currentIds, targetIds) {
+  // Reverse traversal keeps emitted insert/delete indices stable as ops are
+  // applied in order. This is the same invariant as the original algorithm.
+  const ops = []
+  let currentIdx = currentIds.length - 1
+  let targetIdx = targetIds.length - 1
 
-    const maxBatchOps = Number.isFinite(executionOptions.maxBatchOps)
-      ? Math.max(1, Math.floor(executionOptions.maxBatchOps))
-      : DEFAULT_EXECUTION_OPTIONS.maxBatchOps
+  while (currentIdx >= 0 || targetIdx >= 0) {
+    const currentId = currentIds[currentIdx]
+    const targetId = targetIds[targetIdx]
 
-    const maxPayloadBytes = Number.isFinite(executionOptions.maxPayloadBytes)
-      ? Math.max(0, Math.floor(executionOptions.maxPayloadBytes))
-      : DEFAULT_EXECUTION_OPTIONS.maxPayloadBytes
+    // Exact match: no mutation needed, move both pointers.
+    if (currentIdx >= 0 && targetIdx >= 0 && currentId === targetId) {
+      currentIdx--
+      targetIdx--
+      continue
+    }
 
-    this.maxBatchOps = maxBatchOps
-    this.maxPayloadBytes = maxPayloadBytes
-    this.pendingOps = []
-    this.pendingPayloadBytes = 0
+    // If we exhausted current but still have target values, only real ids
+    // should be inserted (null placeholders are user-defined and skipped).
+    if (currentIdx < 0 && targetId === null) {
+      targetIdx--
+      continue
+    }
+
+    if (currentIdx < 0) {
+      ops.push(["insert", dim, 0, targetId])
+      targetIdx--
+      continue
+    }
+
+    // Target exhausted: anything remaining in current must be deleted, except
+    // user-defined placeholders (`null`) which we never delete.
+    if (targetIdx < 0) {
+      if (currentId !== null) {
+        ops.push(["delete", dim, currentIdx])
+      }
+      currentIdx--
+      continue
+    }
+
+    // `null` is a user placeholder. We cannot delete it, so we insert the
+    // target id around it and let future iterations align placeholders.
+    if (currentId === null) {
+      ops.push(["insert", dim, currentIdx + 1, targetId])
+      targetIdx--
+      continue
+    }
+
+    ops.push(["delete", dim, currentIdx])
+    currentIdx--
   }
 
-  async insert(dim, index, value) {
-    await this.queue(["insert", dim, index, value])
-  }
+  return ops
+}
 
-  async delete(dim, index) {
-    await this.queue(["delete", dim, index])
-  }
+async function executeInBatches(api, spreadsheetId, allOps, { maxBatchOps, maxPayloadBytes }) {
+  let batch = []
+  let batchBytes = 0
 
-  async queue(op) {
+  for (const op of allOps) {
     const opBytes = estimateOpBytes(op)
-    const batchFull = this.pendingOps.length >= this.maxBatchOps
-    const payloadFull =
-      this.maxPayloadBytes > 0 &&
-      this.pendingOps.length > 0 &&
-      this.pendingPayloadBytes + opBytes > this.maxPayloadBytes
+    const batchFull = batch.length >= maxBatchOps
+    const payloadFull = maxPayloadBytes > 0 && batch.length > 0 && batchBytes + opBytes > maxPayloadBytes
 
     if (batchFull || payloadFull) {
-      await this.flush()
+      await api.performOps(spreadsheetId, batch)
+      batch = []
+      batchBytes = 0
     }
 
-    this.pendingOps.push(op)
-    this.pendingPayloadBytes += opBytes
+    batch.push(op)
+    batchBytes += opBytes
   }
 
-  async flush() {
-    if (this.pendingOps.length === 0) {
-      return
-    }
-
-    const ops = this.pendingOps
-    this.pendingOps = []
-    this.pendingPayloadBytes = 0
-    await this.api.performOps(this.spreadsheetId, ops)
+  if (batch.length > 0) {
+    await api.performOps(spreadsheetId, batch)
   }
+}
+
+function normalizeExecutionOptions(executionOptions) {
+  return {
+    maxBatchOps: normalizePositiveInt(executionOptions.maxBatchOps, DEFAULT_EXECUTION_OPTIONS.maxBatchOps),
+    maxPayloadBytes: normalizeNonNegativeInt(
+      executionOptions.maxPayloadBytes,
+      DEFAULT_EXECUTION_OPTIONS.maxPayloadBytes
+    ),
+  }
+}
+
+function normalizePositiveInt(value, fallback) {
+  if (!Number.isFinite(value)) {
+    return fallback
+  }
+  return Math.max(1, Math.floor(value))
+}
+
+function normalizeNonNegativeInt(value, fallback) {
+  if (!Number.isFinite(value)) {
+    return fallback
+  }
+  return Math.max(0, Math.floor(value))
 }
 
 function estimateOpBytes(op) {
