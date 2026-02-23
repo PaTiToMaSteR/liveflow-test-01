@@ -302,6 +302,7 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
     strictRules = false,
     asyncDelayMs = 0,
     collectTimingBreakdown = false,
+    applyMode = "splice",
   }) {
     super()
     this.label = label
@@ -312,6 +313,7 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
     this.strictRules = strictRules
     this.asyncDelayMs = asyncDelayMs
     this.collectTimingBreakdown = collectTimingBreakdown
+    this.applyMode = applyMode
 
     this.spreadsheets = {}
     this.opsCount = 0
@@ -323,6 +325,7 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
     this.applyTotalNs = 0n
     this.spliceTotalNs = 0n
     this.progressLogTotalNs = 0n
+    this.rebuildApplyTotalNs = 0n
   }
 
   addSpreadsheet(spreadsheetId, { columns, rows }) {
@@ -375,12 +378,21 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
     const collectTimingBreakdown = this.collectTimingBreakdown
     const applyStart = collectTimingBreakdown ? process.hrtime.bigint() : 0n
     const spreadsheet = this.fetchSpreadsheetState(spreadsheetId)
+    const parsedOps = ops.map(parseOp)
 
-    for (const rawOp of ops) {
-      const op = parseOp(rawOp)
-      this.#validateOp(spreadsheet, op)
-      this.#applySingleOp(spreadsheet, op)
-      this.opsCount += 1
+    if (this.applyMode === "batch_rebuild" && !this.strictRules && this.#canUseBatchRebuild(parsedOps)) {
+      const rebuildStart = collectTimingBreakdown ? process.hrtime.bigint() : 0n
+      this.#applyOpsByBatchRebuild(spreadsheet, parsedOps)
+      this.opsCount += parsedOps.length
+      if (collectTimingBreakdown) {
+        this.rebuildApplyTotalNs += process.hrtime.bigint() - rebuildStart
+      }
+    } else {
+      for (const op of parsedOps) {
+        this.#validateOp(spreadsheet, op)
+        this.#applySingleOp(spreadsheet, op)
+        this.opsCount += 1
+      }
     }
 
     const progressStart = collectTimingBreakdown ? process.hrtime.bigint() : 0n
@@ -425,6 +437,43 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
         return
       default:
         throw new Error(`Unknown action: ${op.action}`)
+    }
+  }
+
+  #canUseBatchRebuild(parsedOps) {
+    const lastIndexByDimension = {
+      row: Number.POSITIVE_INFINITY,
+      column: Number.POSITIVE_INFINITY,
+    }
+
+    for (const op of parsedOps) {
+      if (op.index > lastIndexByDimension[op.dimension]) {
+        return false
+      }
+      lastIndexByDimension[op.dimension] = op.index
+    }
+
+    return true
+  }
+
+  #applyOpsByBatchRebuild(spreadsheet, parsedOps) {
+    const rowOps = []
+    const columnOps = []
+
+    for (const op of parsedOps) {
+      if (op.dimension === "row") {
+        rowOps.push(op)
+      } else {
+        columnOps.push(op)
+      }
+    }
+
+    if (columnOps.length > 0) {
+      spreadsheet.columns = applyDimensionOpsByRebuild(spreadsheet.columns, columnOps)
+    }
+
+    if (rowOps.length > 0) {
+      spreadsheet.rows = applyDimensionOpsByRebuild(spreadsheet.rows, rowOps)
     }
   }
 
@@ -577,6 +626,38 @@ function estimateOpBytes(op) {
   return Buffer.byteLength(JSON.stringify(op), "utf8")
 }
 
+function applyDimensionOpsByRebuild(sourceValues, ops) {
+  if (ops.length === 0) {
+    return sourceValues
+  }
+
+  const pieces = []
+  let tail = sourceValues.length
+
+  for (const op of ops) {
+    if (op.action === "delete") {
+      if (op.index + 1 < tail) {
+        pieces.push(sourceValues.slice(op.index + 1, tail))
+      }
+      tail = op.index
+      continue
+    }
+
+    if (op.index < tail) {
+      pieces.push(sourceValues.slice(op.index, tail))
+    }
+    pieces.push([op.value])
+    tail = op.index
+  }
+
+  const result = sourceValues.slice(0, tail)
+  for (let i = pieces.length - 1; i >= 0; i -= 1) {
+    result.push(...pieces[i])
+  }
+
+  return result
+}
+
 function isQuotaError(error) {
   return error?.status === 429 || error?.code === 429 || /429/.test(String(error?.message))
 }
@@ -604,6 +685,7 @@ async function runSingle(label, impl, fixture, runOptions) {
     strictRules: runOptions.strictRules,
     asyncDelayMs: runOptions.asyncDelayMs,
     collectTimingBreakdown: runOptions.collectBreakdown,
+    applyMode: runOptions.mockApplyMode,
   })
 
   const spreadsheetId = "bench"
@@ -692,6 +774,7 @@ async function runSingle(label, impl, fixture, runOptions) {
     applyNs: mock.applyTotalNs,
     spliceNs: mock.spliceTotalNs,
     progressLogNs: mock.progressLogTotalNs,
+    rebuildApplyNs: mock.rebuildApplyTotalNs,
   }
 
   return {
@@ -769,6 +852,10 @@ async function runBenchmarkForImplementation(label, impl, fixture, options) {
     .map((s) => s.mockStats?.progressLogNs)
     .filter((v) => typeof v === "bigint")
     .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  const mockRebuildApplyTimes = samples
+    .map((s) => s.mockStats?.rebuildApplyNs)
+    .filter((v) => typeof v === "bigint")
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
 
   return {
     label,
@@ -789,6 +876,7 @@ async function runBenchmarkForImplementation(label, impl, fixture, options) {
     mockApplyTimes,
     mockSpliceTimes,
     mockProgressLogTimes,
+    mockRebuildApplyTimes,
   }
 }
 
@@ -841,6 +929,7 @@ function summarizeResult(result) {
     loopOverheadMs: loopOverheadTotal === null ? "-" : formatMs(loopOverheadTotal),
     mockApplyMs: formatBigIntTotal(result.mockApplyTimes),
     mockSpliceMs: formatBigIntTotal(result.mockSpliceTimes),
+    mockRebuildMs: formatBigIntTotal(result.mockRebuildApplyTimes),
     mockProgressLogMs: formatBigIntTotal(result.mockProgressLogTimes),
     p95Ms: formatMs(percentile(result.times, 95)),
     maxMs: formatMs(result.times[result.times.length - 1]),
@@ -903,6 +992,7 @@ function printTimingBreakdownTable(rows) {
     "loopOverheadMs",
     "mockApplyMs",
     "mockSpliceMs",
+    "mockRebuildMs",
     "verifyMs",
   ]
   const tableRows = rows.map((row) => [
@@ -915,6 +1005,7 @@ function printTimingBreakdownTable(rows) {
     row.loopOverheadMs,
     row.mockApplyMs,
     row.mockSpliceMs,
+    row.mockRebuildMs,
     row.verifyMs,
   ])
 
@@ -1016,6 +1107,7 @@ async function main() {
   const backoffMaxRetries = intEnv("BACKOFF_MAX_RETRIES", 0)
   const traceBatching = boolEnv("TRACE_BATCHING", false)
   const collectBreakdown = boolEnv("BREAKDOWN", false)
+  const mockApplyMode = process.env.MOCK_APPLY_MODE ?? "splice"
   const largeRepeat = intEnv("LARGE_REPEAT", 0)
   const largeElixirRepeat = intEnv("LARGE_ELIXIR_REPEAT", 0)
   const usePregeneratedRepeat = boolEnv("USE_PREGENERATED_REPEAT", false)
@@ -1032,7 +1124,7 @@ async function main() {
   console.log("JS local benchmark: fixed implementation")
   console.log(
     `Config: CASE=${caseSelector}, IMPL=${process.env.IMPL ?? "fixed"}, WARMUP=${warmup}, ITERATIONS=${iterations}, ` +
-    `TRACE=${trace}, TRACE_CALLS=${traceCallLimit}, PROGRESS_EVERY=${progressEvery}, STRICT_RULES=${strictRules}, ASYNC_DELAY_MS=${asyncDelayMs}, BREAKDOWN=${collectBreakdown}, ` +
+    `TRACE=${trace}, TRACE_CALLS=${traceCallLimit}, PROGRESS_EVERY=${progressEvery}, STRICT_RULES=${strictRules}, ASYNC_DELAY_MS=${asyncDelayMs}, BREAKDOWN=${collectBreakdown}, MOCK_APPLY_MODE=${mockApplyMode}, ` +
     `BATCHING=${batchingEnabled}, MAX_BATCH_OPS=${maxBatchOps}, MAX_PAYLOAD_BYTES=${maxPayloadBytes}, ` +
     `QUOTA_WRITES_PER_WINDOW=${quotaWritesPerWindow}, QUOTA_WINDOW_MS=${quotaWindowMs}, BACKOFF_BASE_MS=${backoffBaseMs}, BACKOFF_MAX_RETRIES=${backoffMaxRetries}` +
     `${batchSweep ? `, BATCH_SWEEP=${batchSweep.join(",")}` : ""}` +
@@ -1069,6 +1161,7 @@ async function main() {
           strictRules,
           asyncDelayMs,
           collectBreakdown,
+          mockApplyMode,
           batchingEnabled,
           maxBatchOps: batchOpsValue,
           maxPayloadBytes,
@@ -1103,6 +1196,7 @@ async function main() {
         loopOverheadMs: s.loopOverheadMs,
         mockApplyMs: s.mockApplyMs,
         mockSpliceMs: s.mockSpliceMs,
+        mockRebuildMs: s.mockRebuildMs,
         verifyMs: s.verifyMs,
       })
     }
