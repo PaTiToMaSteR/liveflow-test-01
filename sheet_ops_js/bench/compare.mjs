@@ -293,7 +293,16 @@ function describeOps(ops) {
 }
 
 class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
-  constructor({ label, targetState, trace = false, traceCallLimit = 15, progressEvery = 0, strictRules = false, asyncDelayMs = 0 }) {
+  constructor({
+    label,
+    targetState,
+    trace = false,
+    traceCallLimit = 15,
+    progressEvery = 0,
+    strictRules = false,
+    asyncDelayMs = 0,
+    collectTimingBreakdown = false,
+  }) {
     super()
     this.label = label
     this.targetState = cloneState(targetState)
@@ -302,6 +311,7 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
     this.progressEvery = progressEvery
     this.strictRules = strictRules
     this.asyncDelayMs = asyncDelayMs
+    this.collectTimingBreakdown = collectTimingBreakdown
 
     this.spreadsheets = {}
     this.opsCount = 0
@@ -360,7 +370,8 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
   }
 
   #applyOps(spreadsheetId, ops) {
-    const applyStart = process.hrtime.bigint()
+    const collectTimingBreakdown = this.collectTimingBreakdown
+    const applyStart = collectTimingBreakdown ? process.hrtime.bigint() : 0n
     const spreadsheet = this.fetchSpreadsheetState(spreadsheetId)
 
     for (const rawOp of ops) {
@@ -370,10 +381,12 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
       this.opsCount += 1
     }
 
-    const progressStart = process.hrtime.bigint()
+    const progressStart = collectTimingBreakdown ? process.hrtime.bigint() : 0n
     this.#maybeLogProgress(spreadsheetId, ops)
-    this.progressLogTotalNs += process.hrtime.bigint() - progressStart
-    this.applyTotalNs += process.hrtime.bigint() - applyStart
+    if (collectTimingBreakdown) {
+      this.progressLogTotalNs += process.hrtime.bigint() - progressStart
+      this.applyTotalNs += process.hrtime.bigint() - applyStart
+    }
   }
 
   #validateOp(spreadsheet, op) {
@@ -393,15 +406,20 @@ class InstrumentedGoogleSheetsApiMock extends GoogleSheetsApi {
   }
 
   #applySingleOp(spreadsheet, op) {
-    const spliceStart = process.hrtime.bigint()
+    const collectTimingBreakdown = this.collectTimingBreakdown
+    const spliceStart = collectTimingBreakdown ? process.hrtime.bigint() : 0n
     switch (op.action) {
       case "delete":
         spreadsheet[op.dimension + "s"].splice(op.index, 1)
-        this.spliceTotalNs += process.hrtime.bigint() - spliceStart
+        if (collectTimingBreakdown) {
+          this.spliceTotalNs += process.hrtime.bigint() - spliceStart
+        }
         return
       case "insert":
         spreadsheet[op.dimension + "s"].splice(op.index, 0, op.value)
-        this.spliceTotalNs += process.hrtime.bigint() - spliceStart
+        if (collectTimingBreakdown) {
+          this.spliceTotalNs += process.hrtime.bigint() - spliceStart
+        }
         return
       default:
         throw new Error(`Unknown action: ${op.action}`)
@@ -583,6 +601,7 @@ async function runSingle(label, impl, fixture, runOptions) {
     progressEvery: runOptions.progressEvery,
     strictRules: runOptions.strictRules,
     asyncDelayMs: runOptions.asyncDelayMs,
+    collectTimingBreakdown: runOptions.collectBreakdown,
   })
 
   const spreadsheetId = "bench"
@@ -601,14 +620,14 @@ async function runSingle(label, impl, fixture, runOptions) {
     : mock
 
   mock.addSpreadsheet(spreadsheetId, current)
-  const implProfile = {}
+  const implProfile = runOptions.collectBreakdown ? {} : null
 
   const start = process.hrtime.bigint()
   try {
     const result = impl(executionApi, spreadsheetId, current, target, {
       maxBatchOps: runOptions.maxBatchOps,
       maxPayloadBytes: runOptions.maxPayloadBytes,
-      profile: implProfile,
+      ...(implProfile ? { profile: implProfile } : {}),
     })
     if (isPromiseLike(result)) {
       await result
@@ -990,6 +1009,7 @@ async function main() {
   const backoffBaseMs = intEnv("BACKOFF_BASE_MS", 50)
   const backoffMaxRetries = intEnv("BACKOFF_MAX_RETRIES", 0)
   const traceBatching = boolEnv("TRACE_BATCHING", false)
+  const collectBreakdown = boolEnv("BREAKDOWN", false)
   const largeRepeat = intEnv("LARGE_REPEAT", 0)
   const largeElixirRepeat = intEnv("LARGE_ELIXIR_REPEAT", 0)
   const usePregeneratedRepeat = boolEnv("USE_PREGENERATED_REPEAT", false)
@@ -1006,7 +1026,7 @@ async function main() {
   console.log("JS local benchmark: fixed implementation")
   console.log(
     `Config: CASE=${caseSelector}, IMPL=${process.env.IMPL ?? "fixed"}, WARMUP=${warmup}, ITERATIONS=${iterations}, ` +
-    `TRACE=${trace}, TRACE_CALLS=${traceCallLimit}, PROGRESS_EVERY=${progressEvery}, STRICT_RULES=${strictRules}, ASYNC_DELAY_MS=${asyncDelayMs}, ` +
+    `TRACE=${trace}, TRACE_CALLS=${traceCallLimit}, PROGRESS_EVERY=${progressEvery}, STRICT_RULES=${strictRules}, ASYNC_DELAY_MS=${asyncDelayMs}, BREAKDOWN=${collectBreakdown}, ` +
     `BATCHING=${batchingEnabled}, MAX_BATCH_OPS=${maxBatchOps}, MAX_PAYLOAD_BYTES=${maxPayloadBytes}, ` +
     `QUOTA_WRITES_PER_WINDOW=${quotaWritesPerWindow}, QUOTA_WINDOW_MS=${quotaWindowMs}, BACKOFF_BASE_MS=${backoffBaseMs}, BACKOFF_MAX_RETRIES=${backoffMaxRetries}` +
     `${batchSweep ? `, BATCH_SWEEP=${batchSweep.join(",")}` : ""}` +
@@ -1039,6 +1059,7 @@ async function main() {
           progressEvery,
           strictRules,
           asyncDelayMs,
+          collectBreakdown,
           batchingEnabled,
           maxBatchOps: batchOpsValue,
           maxPayloadBytes,
@@ -1081,7 +1102,9 @@ async function main() {
   }
 
   printFinalTable(finalRows)
-  printTimingBreakdownTable(finalRows)
+  if (collectBreakdown) {
+    printTimingBreakdownTable(finalRows)
+  }
   console.log("Done.")
 }
 
