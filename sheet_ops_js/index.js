@@ -27,7 +27,7 @@ export default async function updateSpreadsheet(
     if (profile) profile.dimensionPasses = (profile.dimensionPasses || 0) + 1
 
     // 1. Generate lazy diff ops stream functionally
-    const opsStream = unfoldOps(dimension, currentIds, targetIds)
+    const opsStream = unfoldOps(dimension, currentIds, targetIds, profile)
     
     // 2. Tap profile metrics without mutating the stream directly
     const metricOpsStream = profile 
@@ -38,7 +38,7 @@ export default async function updateSpreadsheet(
       : opsStream
 
     // 3. Transform basic operations sequence into batched subsets stream
-    const batchStream = chunkStream(metricOpsStream, execOpts.maxBatchOps, execOpts.maxPayloadBytes)
+    const batchStream = chunkStream(metricOpsStream, execOpts.maxBatchOps, execOpts.maxPayloadBytes, profile)
     
     // 4. Drive the lazy state machine
     for (const batch of batchStream) {
@@ -110,12 +110,19 @@ function nextDiffState(dimension, currentIds, targetIds, { currentIdx, targetIdx
 }
 
 /**
- * Yields elements evaluated from `nextDiffState` as lazily unfolded iterables.
+ * Yields operations from `nextDiffState` as a lazy stream.
+ *
+ * When a `profile` collector is provided (benchmark-only), the generator records
+ * time spent evaluating the diff transition function into `reconcileNs`.
  */
-function* unfoldOps(dimension, currentIds, targetIds) {
+function* unfoldOps(dimension, currentIds, targetIds, profile = null) {
   let state = { currentIdx: currentIds.length - 1, targetIdx: targetIds.length - 1 }
   while (true) {
+    const stepStart = profile ? process.hrtime.bigint() : 0n
     const result = nextDiffState(dimension, currentIds, targetIds, state)
+    if (profile) {
+      profile.reconcileNs = (profile.reconcileNs || 0n) + (process.hrtime.bigint() - stepStart)
+    }
     if (!result) break
     if (result.op) yield result.op
     state = result.nextState
@@ -123,14 +130,23 @@ function* unfoldOps(dimension, currentIds, targetIds) {
 }
 
 /**
- * Generic lazy transformer that chunks bounded sub-arrays logic
+ * Generic lazy transformer that chunks bounded sub-arrays logic.
+ *
+ * When a `profile` collector is provided (benchmark-only), the generator records
+ * payload estimation time into `estimateNs` and the estimated op bytes into
+ * `estimatedPayloadBytes`.
  */
-function* chunkStream(iterable, maxBatchOps, maxPayloadBytes) {
+function* chunkStream(iterable, maxBatchOps, maxPayloadBytes, profile = null) {
   let batch = []
   let bytes = 0
 
   for (const item of iterable) {
+    const estimateStart = profile ? process.hrtime.bigint() : 0n
     const itemBytes = estimateOpBytes(item)
+    if (profile) {
+      profile.estimateNs = (profile.estimateNs || 0n) + (process.hrtime.bigint() - estimateStart)
+      profile.estimatedPayloadBytes = (profile.estimatedPayloadBytes || 0) + itemBytes
+    }
     const wouldExceedSize = maxPayloadBytes > 0 && batch.length > 0 && (bytes + itemBytes > maxPayloadBytes)
     const wouldExceedCount = batch.length >= maxBatchOps
 

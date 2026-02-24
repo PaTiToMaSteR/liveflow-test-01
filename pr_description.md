@@ -1,57 +1,80 @@
-# Refactor SheetOpsJS Execution to Pure Functional Paradigm
+# Refactor SheetOpsJS Execution to a Functional Stream Pipeline
 
 ## Summary
-This PR fundamentally refactors the core orchestration path of `SheetOpsJS`, migrating it from an imperative, state-heavy looping structure into a clean, predictable, strictly functional architecture. It replaces complex index mutation with pure state transitions and lazy data streams, bringing the JavaScript implementation into alignment with the functional paradigms prioritized by the LiveFlow engineering team (mirroring patterns common in Elixir).
+This PR refactors the core orchestration path of `SheetOpsJS` into a more functional, stream-oriented execution pipeline while preserving the challenge contract. It keeps the async fix and batched execution behavior, but restructures the implementation around composable helpers (`nextDiffState`, `unfoldOps`, `tapStream`, `chunkStream`) so the diffing and execution flow is easier to reason about and benchmark.
 
 ## Important context (Google API in this exercise)
-The provided Google Sheets API class/mock in this exercise is a simulation used for local testing. It is useful for validating correctness and execution behavior, but it does not fully model production constraints (like massive heap sizes or operation boundaries).
+The provided Google Sheets API class/mock in this exercise is a simulation used for local testing. It is useful for validating correctness and execution behavior, but it does not fully model production constraints (quotas, backend processing boundaries, network latency variance, etc.).
 
-By introducing lazy streams (generators), our functional implementation ensures that memory safely stays pristine even under the largest theoretical boundaries. This resolves risks of V8 `maximum call stack size exceeded` errors or aggressive garbage collection stalls that occur when buffering massive `N` operation arrays all at once in JS arrays.
+This refactor keeps the streaming behavior (generators) so operations can flow from diffing to execution without materializing a giant operations array up front.
 
-## Issue
-The original `index.js` `updateSpreadsheet` implementation had several underlying design flaws:
-1. **Unpredictable Mutability:** `diffDimensionOps` manipulated bare pointer indices (`currentIdx`, `targetIdx`) deep inside a monolith `while(true)` loop. Small adjustments to the `if` branches risked breaking index-stable traversal rules.
-2. **Entangled Concerns:** The `executeInBatches` function haphazardly mixed checking for batch size (`maxBatchOps`), tallying bytes (`estimateOpBytes`), handling profiling instrumentation (`profile`), and generating final subsets all inside one massive block.
-3. **Hard to Test:** State boundaries could not be unit tested efficiently because the traversal loop could not be isolated from the evaluation rules.
+## Problem Areas Addressed
+1. **Async contract safety:** The original JS path relied on synchronous mock behavior and did not await `api.performOps(...)`.
+2. **Execution coupling:** Diffing, batching, and API execution were harder to follow as a single imperative flow.
+3. **Benchmark visibility:** After refactors, the benchmark needed stable profiling hooks (`reconcileNs`, `estimateNs`, `apiAwaitNs`, etc.) to keep the timing breakdown useful.
 
 ## Fixes in this PR
 
-### 1) Purely Functional Transition Engine
-- Replaced the mutable `while` logic inside `diffDimensionOps` with a purely functional state transition method (`nextDiffState`).
-- `nextDiffState` evaluates a static generic `state` object and simply returns `{ op, nextState }`.
-- **Gain:** This unlocks strict, pure functional testing for the alignment logic. There are no mutable variables left to pollute edge cases.
+### 1) Functional-style transition engine
+- Introduced `nextDiffState(...)` to represent one reconciliation step as `{ op, nextState }`.
+- `unfoldOps(...)` lazily evaluates that state transition and yields ordered operations.
+- **Gain:** The reconciliation rules are now easier to inspect in isolation and can be reasoned about as state transitions.
 
 ### 2) Lazy Stream Generation (Generators)
-- Slicing and iterating across huge arrays using `.push()` or `.splice()` requires allocating massive transitional arrays in the JS Heap.
-- In this PR, we utilize standard JavaScript Generators (`function*`) to create lazy, composable sequence streams (`unfoldOps`).
-- Operations now flow sequentially from diffing directly into executing, one by one.
+- Uses JavaScript generators (`function*`) so operations flow sequentially from diffing into execution.
+- Avoids buffering one giant planned-op array before execution.
 
-### 3) Separation of Concerns in Pipeline Execution
-- All distinct execution concerns have been functionally separated into discrete stream handlers.
-- **Metric Tracking:** Extracted benchmarking overhead (`profile`) away from the algorithm core utilizing an overlaid, non-mutating stream tap (`tapStream(iterable, tapFn)`).
-- **Dynamic Chunking:** Handled bounds execution slicing internally with a highly isolated generic stream chunker (`chunkStream(iterable, size, bytes)`).
+### 3) Separation of concerns in pipeline execution
+- `tapStream(iterable, tapFn)` overlays benchmark metrics collection without changing yielded operations.
+- `chunkStream(iterable, maxBatchOps, maxPayloadBytes)` handles batch slicing and payload guardrails.
+- `updateSpreadsheet(...)` drives the pipeline and performs ordered API calls.
+
+### 4) Async-safe execution retained
+- The API execution path remains `async` and correctly awaits `performOps(...)`.
+- Tests continue to validate behavior against the provided async API contract.
+
+### 5) Benchmark profiling compatibility restored
+- Restored benchmark profiling counters expected by `bench/compare.mjs`, including:
+  - `reconcileNs`
+  - `estimateNs`
+  - `estimatedPayloadBytes`
+  - `apiAwaitNs`
+  - `executeLoopNs`
+- This keeps `BREAKDOWN=1` output meaningful after the refactor.
 
 ## Validation
 
 ### Tests
 ```bash
-npm test
+cd sheet_ops_js
+npm test -- --runInBand
 ```
 
-Result locally: `6` tests, `0` failures. The public API interface and contract bounds remained strictly enforced natively spanning exact, simple, and the large bound (`99,996` constraints subset) test cases.
+Result locally: `6` tests, `0` failures
 
 ### Benchmark (local mock, no credentials)
 ```bash
+cd sheet_ops_js
 CASE=example2,large_repeat LARGE_REPEAT=8 USE_PREGENERATED_REPEAT=1 IMPL=fixed WARMUP=0 ITERATIONS=1 BATCHING=0 BATCH_SWEEP=500 MAX_PAYLOAD_BYTES=1500000 BREAKDOWN=1 MOCK_APPLY_SWEEP=splice,batch_rebuild node bench/compare.mjs
 ```
 
-**Results against `~800k` operation bounds:**
+**Example results (machine-dependent) for `~800k` operations (`large_repeat x8`):**
 ```
-large_repeat | fixed | batch500 | 799968 ops | 1600 calls | 2431 ms (using batch_rebuild)
+large_repeat | fixed | batch500 | 799968 ops | 1600 calls | ... ms
 ```
-The functional implementation cleanly executed continuous operations via iterations locally without heap constraints breaking down or timing regressions.
+
+The benchmark also prints a `Mock Apply Mode Improvement Summary` with `x` ratios (same solution, same ops/calls, different local mock apply strategy), for example:
+- `example2`: ~`2x` total speedup (`splice` -> `batch_rebuild`)
+- `large` / `large_repeat`: often `10x+` total speedup in the local mock
+- `mockApplyMs` / `innerLoopSpeedup`: typically much larger (`10x+`) on large synthetic cases
+
+Interpretation:
+- This does **not** mean the submitted solution changed semantics or op counts.
+- It demonstrates that repeated `splice()` in the local mock can dominate benchmark runtime for large synthetic workloads.
+- `batch_rebuild` is **benchmark-only** (diagnostic), not a product/runtime behavior change.
 
 ## Scope
 ### Notes
 - Kept public API compatibility exactly as required (`updateSpreadsheet` acts identical on the surface).
-- The `digitCount` and `estimateOpBytes` utilities have remained standard pure mathematical functions to retain exact benchmark parity.
+- The `digitCount` and `estimateOpBytes` utilities remain lightweight numeric helpers for benchmark parity.
+- Functional-style refactor improves structure/readability, but still intentionally uses local mutable state inside generators/batching where practical in JS.
