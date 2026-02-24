@@ -1033,6 +1033,23 @@ function selectCases(allCases, caseSelector) {
     return allCases
   }
 
+  if (caseSelector.includes(",")) {
+    const selected = {}
+    for (const name of caseSelector.split(",").map((value) => value.trim()).filter(Boolean)) {
+      const fixture = allCases[name]
+      if (!fixture) {
+        throw new Error(`Unknown CASE=${name}. Valid values: ${Object.keys(allCases).join(", ")}, all`)
+      }
+      selected[name] = fixture
+    }
+
+    if (Object.keys(selected).length === 0) {
+      throw new Error(`CASE must contain at least one case name. Valid values: ${Object.keys(allCases).join(", ")}, all`)
+    }
+
+    return selected
+  }
+
   const fixture = allCases[caseSelector]
   if (!fixture) {
     throw new Error(`Unknown CASE=${caseSelector}. Valid values: ${Object.keys(allCases).join(", ")}, all`)
@@ -1092,6 +1109,141 @@ function parseBatchSweep() {
   return [...new Set(values)]
 }
 
+function parseMockApplyModes() {
+  const rawSweep = process.env.MOCK_APPLY_SWEEP
+  if (!rawSweep) {
+    return [process.env.MOCK_APPLY_MODE ?? "splice"]
+  }
+
+  const modes = rawSweep
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean)
+
+  if (modes.length === 0) {
+    throw new Error("MOCK_APPLY_SWEEP must contain one or more modes, e.g. 'splice,batch_rebuild'")
+  }
+
+  const allowed = new Set(["splice", "batch_rebuild"])
+  for (const mode of modes) {
+    if (!allowed.has(mode)) {
+      throw new Error(`Unknown mock apply mode '${mode}'. Valid values: splice, batch_rebuild`)
+    }
+  }
+
+  return [...new Set(modes)]
+}
+
+function parseMsNumber(value) {
+  if (value === "-" || value === undefined || value === null) {
+    return null
+  }
+
+  const parsed = Number.parseFloat(String(value))
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function formatRatio(ratio, suffix = "x") {
+  if (!Number.isFinite(ratio) || ratio <= 0) {
+    return "-"
+  }
+  return `${ratio.toFixed(ratio >= 100 ? 0 : ratio >= 10 ? 1 : 2)}${suffix}`
+}
+
+function printMockApplyModeImprovementSummary(rows) {
+  const rowsWithMode = rows.filter((row) => row.mockMode)
+  if (rowsWithMode.length === 0) {
+    return
+  }
+
+  const grouped = new Map()
+  for (const row of rowsWithMode) {
+    const key = `${row.caseName}||${row.implBase}||${row.batchProfile ?? "-"}`
+    if (!grouped.has(key)) {
+      grouped.set(key, { splice: null, batch_rebuild: null })
+    }
+    grouped.get(key)[row.mockMode] = row
+  }
+
+  const summaryRows = []
+  for (const [key, pair] of grouped) {
+    if (!pair.splice || !pair.batch_rebuild) {
+      continue
+    }
+
+    const [caseName, implBase, batchProfile] = key.split("||")
+    const spliceTotalMs = parseMsNumber(pair.splice.totalMs)
+    const rebuildTotalMs = parseMsNumber(pair.batch_rebuild.totalMs)
+    const spliceMockApplyMs = parseMsNumber(pair.splice.mockApplyMs)
+    const rebuildMockApplyMs = parseMsNumber(pair.batch_rebuild.mockApplyMs)
+    const spliceMockSpliceMs = parseMsNumber(pair.splice.mockSpliceMs)
+    const rebuildMockRebuildMs = parseMsNumber(pair.batch_rebuild.mockRebuildMs)
+    const spliceCalls = Number.parseInt(String(pair.splice.calls), 10)
+    const rebuildCalls = Number.parseInt(String(pair.batch_rebuild.calls), 10)
+
+    summaryRows.push({
+      caseName,
+      implBase,
+      batchProfile,
+      ops: String(pair.splice.ops),
+      calls: String(pair.splice.calls),
+      totalMsSplice: pair.splice.totalMs,
+      totalMsRebuild: pair.batch_rebuild.totalMs,
+      totalSpeedup: spliceTotalMs && rebuildTotalMs ? formatRatio(spliceTotalMs / rebuildTotalMs) : "-",
+      mockApplySpeedup:
+        spliceMockApplyMs && rebuildMockApplyMs ? formatRatio(spliceMockApplyMs / rebuildMockApplyMs) : "-",
+      innerLoopSpeedup:
+        spliceMockSpliceMs && rebuildMockRebuildMs ? formatRatio(spliceMockSpliceMs / rebuildMockRebuildMs) : "-",
+      callsSame:
+        Number.isFinite(spliceCalls) && Number.isFinite(rebuildCalls)
+          ? (spliceCalls === rebuildCalls ? "yes" : "no")
+          : "-",
+    })
+  }
+
+  if (summaryRows.length === 0) {
+    return
+  }
+
+  const headers = [
+    "case",
+    "impl",
+    "batch",
+    "ops",
+    "calls",
+    "spliceTotalMs",
+    "rebuildTotalMs",
+    "totalSpeedup",
+    "mockApplySpeedup",
+    "innerLoopSpeedup",
+    "callsSame",
+  ]
+  const tableRows = summaryRows.map((row) => [
+    row.caseName,
+    row.implBase,
+    row.batchProfile,
+    row.ops,
+    row.calls,
+    row.totalMsSplice,
+    row.totalMsRebuild,
+    row.totalSpeedup,
+    row.mockApplySpeedup,
+    row.innerLoopSpeedup,
+    row.callsSame,
+  ])
+  const widths = headers.map((header, i) => Math.max(header.length, ...tableRows.map((r) => r[i].length)))
+  const fmt = (cells) => cells.map((c, i) => c.padEnd(widths[i])).join(" | ")
+  const sep = widths.map((w) => "-".repeat(w)).join("-|-")
+
+  console.log("\nMock Apply Mode Improvement Summary (same solution, same ops/calls)")
+  console.log("Interpretation: compares benchmark mock internals only (`splice` vs `batch_rebuild`) to expose where local runtime is spent.")
+  console.log(fmt(headers))
+  console.log(sep)
+  for (const row of tableRows) {
+    console.log(fmt(row))
+  }
+}
+
 async function main() {
   const warmup = intEnv("WARMUP", 1)
   const iterations = intEnv("ITERATIONS", 3)
@@ -1110,7 +1262,7 @@ async function main() {
   const backoffMaxRetries = intEnv("BACKOFF_MAX_RETRIES", 0)
   const traceBatching = boolEnv("TRACE_BATCHING", false)
   const collectBreakdown = boolEnv("BREAKDOWN", false)
-  const mockApplyMode = process.env.MOCK_APPLY_MODE ?? "splice"
+  const mockApplyModes = parseMockApplyModes()
   const largeRepeat = intEnv("LARGE_REPEAT", 0)
   const largeElixirRepeat = intEnv("LARGE_ELIXIR_REPEAT", 0)
   const usePregeneratedRepeat = boolEnv("USE_PREGENERATED_REPEAT", false)
@@ -1127,7 +1279,7 @@ async function main() {
   console.log("JS local benchmark: fixed implementation")
   console.log(
     `Config: CASE=${caseSelector}, IMPL=${process.env.IMPL ?? "fixed"}, WARMUP=${warmup}, ITERATIONS=${iterations}, ` +
-    `TRACE=${trace}, TRACE_CALLS=${traceCallLimit}, PROGRESS_EVERY=${progressEvery}, STRICT_RULES=${strictRules}, ASYNC_DELAY_MS=${asyncDelayMs}, BREAKDOWN=${collectBreakdown}, MOCK_APPLY_MODE=${mockApplyMode}, ` +
+    `TRACE=${trace}, TRACE_CALLS=${traceCallLimit}, PROGRESS_EVERY=${progressEvery}, STRICT_RULES=${strictRules}, ASYNC_DELAY_MS=${asyncDelayMs}, BREAKDOWN=${collectBreakdown}, MOCK_APPLY_MODE=${mockApplyModes.join(",")}, ` +
     `BATCHING=${batchingEnabled}, MAX_BATCH_OPS=${maxBatchOps}, MAX_PAYLOAD_BYTES=${maxPayloadBytes}, ` +
     `QUOTA_WRITES_PER_WINDOW=${quotaWritesPerWindow}, QUOTA_WINDOW_MS=${quotaWindowMs}, BACKOFF_BASE_MS=${backoffBaseMs}, BACKOFF_MAX_RETRIES=${backoffMaxRetries}` +
     `${batchSweep ? `, BATCH_SWEEP=${batchSweep.join(",")}` : ""}` +
@@ -1149,7 +1301,7 @@ async function main() {
     const results = {}
 
     const batchProfiles = batchSweep ?? [maxBatchOps]
-    if (mockApplyMode === "batch_rebuild" && batchProfiles.includes(1)) {
+    if (mockApplyModes.includes("batch_rebuild") && batchProfiles.includes(1)) {
       console.log(
         "Warning: MOCK_APPLY_MODE=batch_rebuild with batch=1 is a pathological benchmark configuration.\n" +
         "         It rebuilds large arrays for every single op and can take a very long time.\n" +
@@ -1157,30 +1309,36 @@ async function main() {
       )
     }
 
-    for (const batchOpsValue of batchProfiles) {
-      for (const [label, impl] of implEntries) {
-        const resultKey = batchSweep ? `${label}@batch${batchOpsValue}` : label
-        const labelForRun = batchSweep ? `${label} (batch=${batchOpsValue})` : label
+    for (const mockApplyMode of mockApplyModes) {
+      for (const batchOpsValue of batchProfiles) {
+        for (const [label, impl] of implEntries) {
+          const resultKeyBase = batchSweep ? `${label}@batch${batchOpsValue}` : label
+          const resultKey =
+            mockApplyModes.length > 1 ? `${resultKeyBase}@${mockApplyMode}` : resultKeyBase
+          const labelForRunBase = batchSweep ? `${label} (batch=${batchOpsValue})` : label
+          const labelForRun =
+            mockApplyModes.length > 1 ? `${labelForRunBase}, mock=${mockApplyMode}` : labelForRunBase
 
-        results[resultKey] = await runBenchmarkForImplementation(labelForRun, impl, fixture, {
-          warmup,
-          iterations,
-          trace,
-          traceCallLimit,
-          progressEvery,
-          strictRules,
-          asyncDelayMs,
-          collectBreakdown,
-          mockApplyMode,
-          batchingEnabled,
-          maxBatchOps: batchOpsValue,
-          maxPayloadBytes,
-          quotaWritesPerWindow,
-          quotaWindowMs,
-          backoffBaseMs,
-          backoffMaxRetries,
-          traceBatching,
-        })
+          results[resultKey] = await runBenchmarkForImplementation(labelForRun, impl, fixture, {
+            warmup,
+            iterations,
+            trace,
+            traceCallLimit,
+            progressEvery,
+            strictRules,
+            asyncDelayMs,
+            collectBreakdown,
+            mockApplyMode,
+            batchingEnabled,
+            maxBatchOps: batchOpsValue,
+            maxPayloadBytes,
+            quotaWritesPerWindow,
+            quotaWindowMs,
+            backoffBaseMs,
+            backoffMaxRetries,
+            traceBatching,
+          })
+        }
       }
     }
 
@@ -1188,10 +1346,18 @@ async function main() {
     for (const [resultKey, resultValue] of Object.entries(results)) {
       const s = summarizeResult(resultValue)
       console.log(`  ${resultKey} summary: ${JSON.stringify(s)}`)
-      finalRows.push({
-        caseName,
-        impl: resultKey,
-        ops: s.opsCounts.join("/"),
+        const mockModeMatch =
+          mockApplyModes.length > 1 ? /@(splice|batch_rebuild)$/.exec(resultKey)?.[1] ?? null : null
+        const implBaseMatch = /^([^@]+)/.exec(resultKey)?.[1] ?? resultKey
+        const batchMatch = /@batch(\d+)/.exec(resultKey)
+
+        finalRows.push({
+          caseName,
+          impl: resultKey,
+          implBase: implBaseMatch,
+          batchProfile: batchMatch ? `batch${batchMatch[1]}` : null,
+          mockMode: mockModeMatch,
+          ops: s.opsCounts.join("/"),
         calls: s.apiCalls.join("/"),
         maxBatch: s.maxBatchSizes.join("/"),
         flushes: (s.flushCounts?.length ? s.flushCounts.join("/") : "-"),
@@ -1217,6 +1383,9 @@ async function main() {
   printFinalTable(finalRows)
   if (collectBreakdown) {
     printTimingBreakdownTable(finalRows)
+  }
+  if (mockApplyModes.length > 1) {
+    printMockApplyModeImprovementSummary(finalRows)
   }
   console.log("Done.")
 }
